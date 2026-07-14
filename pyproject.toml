@@ -27,12 +27,13 @@ requires = ["setuptools>=68.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["coding_agent*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = ["src"]
 markers = [
-  "local_rg: optional smoke test that uses the locally installed ripgrep binary"
+  "local_rg: optional smoke test that uses the locally installed ripgrep binary",
+  "local_node: optional smoke test that uses the locally installed Node.js runtime"
 ]

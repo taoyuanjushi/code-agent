@@ -4,7 +4,7 @@ import sys
 
 from dotenv import load_dotenv
 
-from .agent import run_agent
+from .agent import run_agent_with_report
 from .config import load_config
 
 
@@ -32,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-approve-commands",
         action="store_true",
         help="run shell commands without interactive approval",
+    )
+    parser.add_argument(
+        "--max-fix-attempts",
+        help="maximum repair patches allowed after a failed verification (default: 3, maximum: 10)",
     )
     parser.add_argument(
         "--context-max-files",
@@ -63,9 +67,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"model: {config.model}")
         print(f"mode: {config.permission_mode}")
 
-        final_answer = run_agent(task, config)
+        report = run_agent_with_report(task, config)
+        if report.verifications:
+            print("\nverification")
+            for result in report.verifications:
+                print(
+                    f"{result.command_id}: {result.status} "
+                    f"(attempt {result.attempt}, {result.duration_ms}ms)"
+                )
+            print(f"final verification status: {report.final_status}")
+
         print("\nfinal")
-        print(final_answer)
+        print(report.answer)
         return 0
     except Exception as exc:
         print(str(exc), file=sys.stderr)

@@ -1,0 +1,5 @@
+from src.refund_service import calculate_refund
+
+
+def test_calculate_refund_subtracts_fee() -> None:
+    assert calculate_refund(100, 5) == 95

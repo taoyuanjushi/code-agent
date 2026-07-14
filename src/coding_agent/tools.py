@@ -1,6 +1,7 @@
 import json
 import re
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,20 @@ from .reader import (
     read_many_files,
 )
 from .search import format_search_matches, search_text
-from .types import AgentConfig, ToolResult
+from .types import MAX_FIX_ATTEMPTS, AgentConfig, ToolResult
+from .verification import (
+    DEFAULT_VERIFICATION_MAX_OUTPUT_BYTES,
+    DEFAULT_VERIFICATION_MAX_OUTPUT_LINES,
+    DEFAULT_VERIFICATION_TIMEOUT_MS,
+    MAX_VERIFICATION_OUTPUT_BYTES,
+    MAX_VERIFICATION_OUTPUT_LINES,
+    MAX_VERIFICATION_TIMEOUT_MS,
+    VerificationCommand,
+    VerificationDiscoveryResult,
+    VerificationResult,
+    discover_verification_commands,
+    run_verification_command,
+)
 
 DEFAULT_READ_FILE_MAX_BYTES = DEFAULT_MAX_BYTES_PER_FILE
 DEFAULT_SEARCH_MAX_RESULTS = 100
@@ -32,6 +46,63 @@ MAX_READ_TOTAL_BYTES = 4_194_304
 MAX_SEARCH_RESULTS = 1_000
 MAX_COMMAND_TIMEOUT_MS = 300_000
 MAX_GLOB_PATTERNS = 100
+
+
+@dataclass
+class VerificationToolState:
+    task: str
+    max_fix_attempts: int
+    discovery: VerificationDiscoveryResult | None = None
+    verification_history: list[VerificationResult] = field(default_factory=list)
+    unresolved_failure_command_id: str | None = None
+    repair_attempts: int = 0
+    after_edit: bool = False
+    edit_generation: int = 0
+    passed_generations: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.task, str):
+            raise TypeError("task must be a string.")
+        if (
+            isinstance(self.max_fix_attempts, bool)
+            or not isinstance(self.max_fix_attempts, int)
+            or self.max_fix_attempts < 0
+            or self.max_fix_attempts > MAX_FIX_ATTEMPTS
+        ):
+            raise ValueError(
+                f"max_fix_attempts must be between 0 and {MAX_FIX_ATTEMPTS}."
+            )
+
+    @property
+    def repair_limit_reached(self) -> bool:
+        return (
+            self.unresolved_failure_command_id is not None
+            and self.repair_attempts >= self.max_fix_attempts
+        )
+
+    def record_patch_applied(self) -> None:
+        if self.unresolved_failure_command_id is not None:
+            self.repair_attempts += 1
+        self.edit_generation += 1
+        self.after_edit = True
+        self.discovery = None
+
+    def record_verification(self, result: VerificationResult) -> None:
+        self.verification_history.append(result)
+        self.after_edit = False
+
+        if result.status == "failed":
+            if self.unresolved_failure_command_id is None:
+                self.repair_attempts = 0
+            self.unresolved_failure_command_id = result.command_id
+            return
+
+        if result.status == "passed":
+            self.passed_generations[result.command_id] = self.edit_generation
+
+        if self.unresolved_failure_command_id == result.command_id:
+            self.unresolved_failure_command_id = None
+            self.repair_attempts = 0
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -164,6 +235,50 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "discover_verification_commands",
+        "description": "Discover trusted project test, lint, type-check, and build commands, ranked for the current task.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Optional task text used to rerank discovered commands.",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "type": "function",
+        "name": "run_verification",
+        "description": "Run one trusted command selected by its discovered command ID. Arbitrary argv is not accepted.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "command_id": {"type": "string", "minLength": 1},
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_VERIFICATION_TIMEOUT_MS,
+                },
+                "max_output_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_VERIFICATION_OUTPUT_BYTES,
+                },
+                "max_output_lines": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_VERIFICATION_OUTPUT_LINES,
+                },
+            },
+            "required": ["command_id"],
+        },
+    },
+    {
+        "type": "function",
         "name": "git_status",
         "description": "Run git status --short in the workspace.",
         "parameters": {"type": "object", "additionalProperties": False, "properties": {}, "required": []},
@@ -196,7 +311,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 
-def execute_tool(config: AgentConfig, name: str, raw_arguments: str) -> ToolResult:
+def execute_tool(
+    config: AgentConfig,
+    name: str,
+    raw_arguments: str,
+    *,
+    state: VerificationToolState | None = None,
+) -> ToolResult:
     try:
         args = _parse_tool_arguments(raw_arguments)
 
@@ -210,11 +331,15 @@ def execute_tool(config: AgentConfig, name: str, raw_arguments: str) -> ToolResu
                 output="write_file is disabled. Submit a unified diff through apply_patch so every edit is reviewable.",
             )
         if name == "apply_patch":
-            return _apply_patch_tool(config, args)
+            return _apply_patch_tool(config, args, state=state)
         if name == "list_files":
             return _list_files_tool(config, args)
         if name == "search_text":
             return _search_text_tool(config, args)
+        if name == "discover_verification_commands":
+            return _discover_verification_tool(config, args, state=state)
+        if name == "run_verification":
+            return _run_verification_tool(config, args, state=state)
         if name == "git_status":
             return _run_shell_command("git status --short", config.workspace, 30_000)
         if name == "git_diff":
@@ -322,11 +447,31 @@ def _read_many_files_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResu
     )
 
 
-def _apply_patch_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
+def _apply_patch_tool(
+    config: AgentConfig,
+    args: dict[str, Any],
+    *,
+    state: VerificationToolState | None = None,
+) -> ToolResult:
     if config.permission_mode != "workspace-write":
         return ToolResult(
             ok=False,
             output="apply_patch is disabled in read-only mode. Re-run with --write to allow workspace edits.",
+        )
+
+    if state is not None and state.repair_limit_reached:
+        return ToolResult(
+            ok=False,
+            output=(
+                "Repair attempt limit reached; no additional patch was applied "
+                f"while {state.unresolved_failure_command_id} is failing."
+            ),
+            data={
+                "type": "repair_limit_reached",
+                "failed_command_id": state.unresolved_failure_command_id,
+                "repair_attempts": state.repair_attempts,
+                "max_fix_attempts": state.max_fix_attempts,
+            },
         )
 
     patch = _require_string(args.get("patch"), "patch")
@@ -345,7 +490,22 @@ def _apply_patch_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
             return ToolResult(ok=False, output="User declined patch application.")
 
     apply_patch_plan(patch_plan)
-    return ToolResult(ok=True, output=f"Applied patch:\n{summary}")
+    data: dict[str, object] | None = None
+    if state is not None:
+        state.record_patch_applied()
+        data = {
+            "type": "patch_applied",
+            "edit_generation": state.edit_generation,
+            "failed_command_id": state.unresolved_failure_command_id,
+            "repair_attempts": state.repair_attempts,
+            "max_fix_attempts": state.max_fix_attempts,
+            "repair_limit_reached": state.repair_limit_reached,
+        }
+    return ToolResult(
+        ok=True,
+        output=f"Applied patch:\n{summary}",
+        data=data,
+    )
 
 
 def _list_files_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
@@ -387,6 +547,174 @@ def _search_text_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
     )
 
     return ToolResult(ok=True, output=format_search_matches(matches))
+
+
+def _discover_verification_tool(
+    config: AgentConfig,
+    args: dict[str, Any],
+    *,
+    state: VerificationToolState | None,
+) -> ToolResult:
+    _reject_unknown_arguments(args, {"task"})
+    current_state = state or VerificationToolState(
+        task="",
+        max_fix_attempts=config.max_fix_attempts,
+    )
+    if "task" in args:
+        current_state.task = _require_string(args["task"], "task")
+
+    discovery = discover_verification_commands(
+        config.workspace,
+        task=current_state.task,
+        failed_command_id=current_state.unresolved_failure_command_id,
+        after_edit=current_state.after_edit,
+    )
+    current_state.discovery = discovery
+    data = {
+        "type": "verification_discovery",
+        "workspace": discovery.workspace,
+        "commands": [_verification_command_data(command) for command in discovery.commands],
+        "warnings": list(discovery.warnings),
+        "errors": list(discovery.errors),
+    }
+    lines = [
+        f"{command.id} [{command.kind}] {'available' if command.available else 'unavailable'}"
+        f" - {command.reason or 'unranked'}"
+        for command in discovery.commands
+    ]
+    if discovery.warnings:
+        lines.extend(f"warning: {warning}" for warning in discovery.warnings)
+    if discovery.errors:
+        lines.extend(f"error: {error}" for error in discovery.errors)
+    return ToolResult(
+        ok=not discovery.errors,
+        output="\n".join(lines) or "No verification commands discovered.",
+        data=data,
+    )
+
+
+def _run_verification_tool(
+    config: AgentConfig,
+    args: dict[str, Any],
+    *,
+    state: VerificationToolState | None,
+) -> ToolResult:
+    _reject_unknown_arguments(
+        args,
+        {"command_id", "timeout_ms", "max_output_bytes", "max_output_lines"},
+    )
+    command_id = _require_string(args.get("command_id"), "command_id")
+    current_state = state or VerificationToolState(
+        task="",
+        max_fix_attempts=config.max_fix_attempts,
+    )
+
+    if current_state.passed_generations.get(command_id) == current_state.edit_generation:
+        data = {
+            "type": "verification_skipped",
+            "command_id": command_id,
+            "reason": "already passed after the latest edit",
+        }
+        return ToolResult(ok=False, output=data["reason"], data=data)
+
+    if current_state.discovery is None:
+        current_state.discovery = discover_verification_commands(
+            config.workspace,
+            task=current_state.task,
+            failed_command_id=current_state.unresolved_failure_command_id,
+            after_edit=current_state.after_edit,
+        )
+
+    attempt = 1 + sum(
+        result.command_id == command_id
+        for result in current_state.verification_history
+    )
+    approval_callback = None
+    if not config.auto_approve_commands:
+        approval_callback = _approve_verification_command
+
+    result = run_verification_command(
+        config.workspace,
+        command_id=command_id,
+        discovery=current_state.discovery,
+        timeout_ms=_require_positive_int(
+            args,
+            "timeout_ms",
+            default=DEFAULT_VERIFICATION_TIMEOUT_MS,
+            maximum=MAX_VERIFICATION_TIMEOUT_MS,
+        ),
+        max_output_bytes=_require_positive_int(
+            args,
+            "max_output_bytes",
+            default=DEFAULT_VERIFICATION_MAX_OUTPUT_BYTES,
+            maximum=MAX_VERIFICATION_OUTPUT_BYTES,
+        ),
+        max_output_lines=_require_positive_int(
+            args,
+            "max_output_lines",
+            default=DEFAULT_VERIFICATION_MAX_OUTPUT_LINES,
+            maximum=MAX_VERIFICATION_OUTPUT_LINES,
+        ),
+        attempt=attempt,
+        approval_callback=approval_callback,
+    )
+    current_state.record_verification(result)
+    data = _verification_result_data(result, state=current_state)
+    return ToolResult(
+        ok=result.status == "passed",
+        output=result.output or f"Verification {result.status}: {command_id}",
+        data=data,
+    )
+
+
+def _approve_verification_command(command: VerificationCommand) -> bool:
+    rendered = subprocess.list2cmdline(list(command.argv))
+    print(f"Run verification in {command.cwd}?\n{rendered}")
+    return input("Run verification? [y/N] ").strip().lower() in {"y", "yes"}
+
+
+def _verification_command_data(command: VerificationCommand) -> dict[str, object]:
+    return {
+        "id": command.id,
+        "kind": command.kind,
+        "argv": list(command.argv),
+        "cwd": command.cwd,
+        "source": command.source,
+        "available": command.available,
+        "unavailable_reason": command.unavailable_reason,
+        "reason": command.reason,
+    }
+
+
+def _verification_result_data(
+    result: VerificationResult,
+    *,
+    state: VerificationToolState,
+) -> dict[str, object]:
+    return {
+        "type": "verification_result",
+        "command_id": result.command_id,
+        "kind": result.kind,
+        "status": result.status,
+        "argv": list(result.argv),
+        "cwd": result.cwd,
+        "exit_code": result.exit_code,
+        "duration_ms": result.duration_ms,
+        "truncated": result.truncated,
+        "omitted_lines": result.omitted_lines,
+        "omitted_bytes": result.omitted_bytes,
+        "attempt": result.attempt,
+        "active_failure_command_id": state.unresolved_failure_command_id,
+        "repair_attempts": state.repair_attempts,
+        "max_fix_attempts": state.max_fix_attempts,
+        "repair_limit_reached": state.repair_limit_reached,
+    }
+
+
+def _reject_unknown_arguments(args: dict[str, Any], allowed: set[str]) -> None:
+    unexpected = sorted(set(args) - allowed)
+    if unexpected:
+        raise ValueError(f"Unexpected argument(s): {', '.join(unexpected)}")
 
 
 def _run_command_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:

@@ -1,0 +1,20 @@
+{
+  "name": "m3-typescript-fixture",
+  "private": true,
+  "version": "0.0.0",
+  "packageManager": "npm@10.8.2",
+  "scripts": {
+    "test": "node --test tests/refund.test.js",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.json",
+    "install": "node scripts/install.js",
+    "publish": "node scripts/publish.js",
+    "deploy": "node scripts/deploy.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
+    "typescript": "^5.5.0"
+  }
+}

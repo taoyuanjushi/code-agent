@@ -236,3 +236,39 @@ def test_system_prompt_guides_search_then_read_project_understanding(
     )
     assert "guidance rather than a hardcoded requirement" in prompt
     assert "gather file-content evidence before editing" in prompt
+
+
+def test_system_prompt_defines_evidence_driven_verification_workflow(
+    tmp_path: Path,
+) -> None:
+    config = AgentConfig(
+        workspace=str(tmp_path),
+        model="fake-model",
+        reasoning_effort="medium",
+        max_turns=4,
+        permission_mode="workspace-write",
+        auto_approve_commands=False,
+        auto_approve_edits=False,
+        context_max_files=6,
+        context_max_bytes_per_file=8_000,
+    )
+
+    prompt = build_system_prompt(config)
+    verification_steps = [
+        "Call discover_verification_commands before running project checks",
+        "Select the most task-relevant available command",
+        "Before editing, search for and read the code, tests, and diagnostics",
+        "After every successful apply_patch, run at least one relevant",
+        "If verification fails, extract the reported path, symbol, line number",
+        "Rerun the same failed command after the repair",
+        "report the commands run and their final statuses",
+        "Stop applying patches when the repair limit is reached",
+    ]
+
+    assert "Verification workflow:" in prompt
+    assert [prompt.index(step) for step in verification_steps] == sorted(
+        prompt.index(step) for step in verification_steps
+    )
+    assert "never guess a command or arbitrary argv" in prompt
+    assert "any skipped checks and the reason they were skipped" in prompt
+    assert "run a broader relevant check when one is available" in prompt

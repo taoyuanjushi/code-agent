@@ -1,8 +1,8 @@
-﻿# Repository Guidelines
+# Repository Guidelines
 
 ## Project Structure & Module Organization
 
-The Python package lives in `coding_agent/`. `cli.py` provides the command-line entry point, `agent.py` owns the model/tool loop, and modules such as `patch.py`, `path_safety.py`, `search.py`, and `tools.py` isolate filesystem and command behavior. Tests mirror these modules under `tests/` as `test_<module>.py`. Design notes belong in `docs/`; packaging and test configuration are in `pyproject.toml`. Generated files, virtual environments, logs, and secrets must remain untracked according to `.gitignore`.
+The Python package uses a standard src layout and lives in `src/coding_agent/`. `cli.py` provides the command-line entry point, `agent.py` owns the model/tool loop, and modules such as `patch.py`, `path_safety.py`, `search.py`, and `tools.py` isolate filesystem and command behavior. Tests mirror these modules under `tests/` as `test_<module>.py`. Design notes belong in `docs/`; packaging and test configuration are in `pyproject.toml`. Generated files, virtual environments, logs, and secrets must remain untracked according to `.gitignore`.
 
 ## Build, Test, and Development Commands
 

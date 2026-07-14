@@ -71,7 +71,7 @@ Responses API 是当前代理循环的基础，因为它天然支持多轮响应
 
 ### 4.1 CLI 层
 
-文件：`coding_agent/cli.py`
+文件：`src/coding_agent/cli.py`
 
 职责：
 
@@ -104,7 +104,7 @@ coding-agent session replay
 
 ### 4.2 配置层
 
-文件：`coding_agent/config.py`
+文件：`src/coding_agent/config.py`
 
 职责：
 
@@ -122,7 +122,7 @@ coding-agent session replay
 
 ### 4.3 上下文层
 
-文件：`coding_agent/context.py`
+文件：`src/coding_agent/context.py`
 
 当前能力：
 
@@ -142,7 +142,7 @@ coding-agent session replay
 
 ### 4.4 代理循环
 
-文件：`coding_agent/agent.py`
+文件：`src/coding_agent/agent.py`
 
 当前流程：
 
@@ -166,7 +166,7 @@ coding-agent session replay
 
 ### 4.5 工具层
 
-文件：`coding_agent/tools.py`
+文件：`src/coding_agent/tools.py`
 
 当前工具：
 
@@ -199,7 +199,7 @@ coding-agent session replay
 
 ### 4.6 路径和权限
 
-文件：`coding_agent/path_safety.py`
+文件：`src/coding_agent/path_safety.py`
 
 当前能力：
 
@@ -437,7 +437,7 @@ run_ripgrep({"pattern": "TODO", "path": "coding_agent"})
 
 已交付：
 
-- `coding_agent/patch.py`：解析 unified diff、校验 hunk 上下文、应用新增/修改/删除文件。
+- `src/coding_agent/patch.py`：解析 unified diff、校验 hunk 上下文、应用新增/修改/删除文件。
 - `apply_patch` 工具：在 `--write` 模式下应用补丁，默认需要人工确认。
 - `--auto-approve-edits`：允许自动应用补丁，适合测试或受控环境。
 - `git_status` 和 `git_diff` 工具：用于查看修改后的工作区状态和差异。
@@ -451,7 +451,7 @@ run_ripgrep({"pattern": "TODO", "path": "coding_agent"})
 - symlink、junction 和敏感文件 denylist。
 - 持久化审批与 diff 审计日志。
 
-### M2：更强的项目理解
+### M2：更强的项目理解（已完成）
 
 目标：
 
@@ -461,23 +461,24 @@ run_ripgrep({"pattern": "TODO", "path": "coding_agent"})
 - 多文件按需读取
 - 文件相关性排序
 
-建议验收：
+验收结果：
 
-- 中型项目中不需要一次性塞入大量上下文。
-- 模型能自主搜索并定位相关文件。
+- 已通过统一忽略策略、嵌套指令、中型仓库搜索→读取流程和参数边界测试。
+- 初始上下文固定为最多 6 个样本，内容总量不超过 64 KiB，目标源码不预先注入。
+- 全量测试已通过；具体步骤和测试矩阵见 `docs/m2-implementation-guide.md`。
 
-### M3：验证闭环
+### M3：验证闭环（已完成）
 
 目标：
 
-- 自动识别 test/build/lint 命令
-- 失败输出压缩
-- 迭代修复循环
-- 验证结果结构化记录
+- 从 `pyproject.toml` 和 `package.json` 自动识别 test/lint/typecheck/build 命令。
+- 使用参数数组和受控执行器运行已发现的验证命令。
+- 在固定字节数和行数预算内压缩失败输出。
+- 记录结构化验证结果，并驱动“失败→读取→修改→重试”循环。
 
-建议验收：
-
-- 对小型 TS/Python 项目可完成“修复测试”闭环。
+实施顺序和固定验收指标见 docs/m3-implementation-guide.md。
+已完成验收契约、验证领域模型、Python/TypeScript 统一命令发现、稳定且可解释的相关性排序、使用 argv 和 `shell=False` 的受控执行、错误上下文压缩、结构化验证工具、验证历史和有次数上限的失败后迭代修复循环。
+建议验收：对小型 Python/TypeScript 项目完成一次可审计的“修复测试”闭环。
 
 ### M4：会话持久化
 
@@ -528,22 +529,18 @@ run_ripgrep({"pattern": "TODO", "path": "coding_agent"})
 
 建议按以下顺序继续：
 
-1. 将主实现切换为 Python 3.12。已完成。
-2. 增加 OpenAI client 抽象，方便 mock。已完成。
-3. 增加 `search_text` 工具。已完成。
-4. 增加 `git_status` 和 `git_diff` 工具。已完成。
-5. 用 `apply_patch` 替换直接 `write_file`，强制 diff-first。已完成并通过集成测试。
-6. 增加 session JSONL。
-7. 增加 fixture 集成测试。
-8. 加入流式输出。
-9. 加入 `.coding-agent/config.json`。
-10. 再考虑 IDE 或 Web UI。
+1. 完成 M1 安全编辑闭环。已完成。
+2. 完成 M2 项目理解和中型仓库验收。已完成。
+3. 完成 M3 验证命令发现、结构化结果和迭代修复。已完成。
+4. 保持 Python 默认测试和可选 TypeScript/Node smoke test 分离。已完成。
+5. 实现 M4 JSONL session、resume、replay 和审批审计。
+6. 再加入更严格的 shell 沙箱、流式输出、配置文件和 IDE/Web UI。
 
 ## 12. 已知风险
 
 - Shell 字符串执行需要进一步限制。
 - `write_file` 已停用，但通过 shell 执行修改命令仍需要进一步限制和审计。
-- 当前上下文采样对大仓库不够智能。
+- 当前基于规则的相关性排序对复杂语义任务仍有限。
 - Responses API 返回对象结构在 SDK 版本变化时可能需要调整。
 - 真实模型调用成本和时延需要通过配置控制。
 - Windows、macOS、Linux 的 shell 行为不同，需要跨平台测试。

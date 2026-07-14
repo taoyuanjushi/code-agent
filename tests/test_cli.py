@@ -11,6 +11,8 @@ def test_build_parser_accepts_python_main_options() -> None:
             "--auto-approve-commands",
             "--reasoning-effort",
             "medium",
+            "--max-fix-attempts",
+            "4",
             "fix tests",
         ]
     )
@@ -19,6 +21,7 @@ def test_build_parser_accepts_python_main_options() -> None:
     assert args.auto_approve_edits is True
     assert args.auto_approve_commands is True
     assert args.reasoning_effort == "medium"
+    assert args.max_fix_attempts == "4"
     assert args.task == ["fix tests"]
 
 def test_load_config_uses_m2_initial_context_defaults() -> None:
@@ -28,3 +31,4 @@ def test_load_config_uses_m2_initial_context_defaults() -> None:
 
     assert config.context_max_files == 6
     assert config.context_max_bytes_per_file == 8_000
+    assert config.max_fix_attempts == 3

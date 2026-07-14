@@ -13,8 +13,17 @@ PROJECT_UNDERSTANDING_WORKFLOW = """Project understanding workflow:
 Preferred tool sequence when discovery and editing are needed:
 ranked inventory -> search_text -> read_many_files -> apply_patch -> git_diff
 
-Treat this sequence as guidance rather than a hardcoded requirement.
-Skip stages that do not apply, but gather file-content evidence before editing or making implementation claims."""
+Verification workflow:
+1. Call discover_verification_commands before running project checks; never guess a command or arbitrary argv.
+2. Select the most task-relevant available command from the discovery result.
+3. Before editing, search for and read the code, tests, and diagnostics that justify the change.
+4. After every successful apply_patch, run at least one relevant discovered verification command.
+5. If verification fails, extract the reported path, symbol, line number, or diagnostic; search and read that evidence before patching again.
+6. Rerun the same failed command after the repair; once it passes, run a broader relevant check when one is available.
+7. In the final answer, report the commands run and their final statuses, plus any skipped checks and the reason they were skipped.
+8. Stop applying patches when the repair limit is reached, and explicitly report the unresolved verification failure.
+
+Treat these sequences as guidance rather than a hardcoded requirement. Skip stages that do not apply, but gather file-content evidence before editing or making implementation claims. Use run_command only when no trusted discovered verification command covers the required check."""
 
 
 def build_system_prompt(
@@ -55,7 +64,8 @@ Execution rules:
 - In read-only mode, do not call apply_patch or run commands that modify files.
 - In workspace-write mode, write only inside the workspace.
 - All file edits must use apply_patch; write_file is intentionally unavailable.
-- Use run_command for inspection and verification, not as a substitute for editing files.
+- Prefer discover_verification_commands and run_verification for project checks; they prevent arbitrary argv injection and return structured results.
+- Use run_command for inspection or checks that discovery cannot represent, not as a substitute for editing files.
 - Use git_status and git_diff after edits when available.
 - Explain important actions before taking them.
 - Avoid destructive commands unless the user explicitly asks for them.

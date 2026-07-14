@@ -1,5 +1,6 @@
 import json
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from .context import (
     DEFAULT_MAX_INVENTORY_FILES,
@@ -10,8 +11,16 @@ from .context import (
 from .instructions import discover_agent_instructions
 from .model_client import ModelClient, OpenAIResponsesClient
 from .prompts import build_system_prompt, build_user_prompt
-from .tools import execute_tool
+from .tools import VerificationToolState, execute_tool
 from .types import AgentConfig
+from .verification import VerificationResult
+
+
+@dataclass(frozen=True)
+class AgentRunReport:
+    answer: str
+    verifications: tuple[VerificationResult, ...]
+    final_status: Literal["passed", "failed", "not_run"]
 
 
 def run_agent(
@@ -19,7 +28,19 @@ def run_agent(
     config: AgentConfig,
     model_client: ModelClient | None = None,
 ) -> str:
+    return run_agent_with_report(task, config, model_client=model_client).answer
+
+
+def run_agent_with_report(
+    task: str,
+    config: AgentConfig,
+    model_client: ModelClient | None = None,
+) -> AgentRunReport:
     client = model_client or OpenAIResponsesClient()
+    verification_state = VerificationToolState(
+        task=task,
+        max_fix_attempts=config.max_fix_attempts,
+    )
     repository_instructions = discover_agent_instructions(config.workspace)
     snapshot = collect_workspace_snapshot(
         config.workspace,
@@ -42,12 +63,27 @@ def run_agent(
         tool_calls = _find_function_calls(response)
 
         if not tool_calls:
-            return _get_output_text(response)
+            answer = _get_output_text(response)
+            final_status = _verification_final_status(verification_state)
+            if final_status == "failed":
+                answer = (
+                    f"{answer}\n\n{_verification_failure_note(verification_state)}"
+                ).strip()
+            return AgentRunReport(
+                answer=answer,
+                verifications=tuple(verification_state.verification_history),
+                final_status=final_status,
+            )
 
         tool_outputs: list[dict[str, Any]] = []
         for call in tool_calls:
             print(f"\ntool: {call['name']}")
-            result = execute_tool(config, call["name"], call["arguments"])
+            result = execute_tool(
+                config,
+                call["name"],
+                call["arguments"],
+                state=verification_state,
+            )
             print("ok" if result.ok else "failed")
             if result.output:
                 print(_truncate_for_console(result.output))
@@ -60,6 +96,7 @@ def run_agent(
                         {
                             "ok": result.ok,
                             "output": result.output,
+                            "data": result.data,
                         },
                         ensure_ascii=False,
                     ),
@@ -73,6 +110,59 @@ def run_agent(
         )
 
     raise RuntimeError(f"Agent stopped after reaching max turn limit ({config.max_turns}).")
+
+
+def _verification_final_status(
+    state: VerificationToolState,
+) -> Literal["passed", "failed", "not_run"]:
+    if not state.verification_history:
+        return "not_run"
+
+    latest_by_command = _latest_verification_results(state)
+    if not all(result.status == "passed" for result in latest_by_command.values()):
+        return "failed"
+    if not all(
+        state.passed_generations.get(command_id) == state.edit_generation
+        for command_id in latest_by_command
+    ):
+        return "failed"
+    return "passed"
+
+
+def _verification_failure_note(state: VerificationToolState) -> str:
+    latest_by_command = _latest_verification_results(state)
+    messages: list[str] = []
+
+    non_passing = [
+        f"{command_id} ({result.status})"
+        for command_id, result in latest_by_command.items()
+        if result.status != "passed"
+    ]
+    if non_passing:
+        messages.append(f"Verification did not pass: {', '.join(non_passing)}.")
+
+    stale = [
+        command_id
+        for command_id, result in latest_by_command.items()
+        if result.status == "passed"
+        and state.passed_generations.get(command_id) != state.edit_generation
+    ]
+    if stale:
+        messages.append(
+            "Verification results are stale after the latest edit and were not "
+            f"rerun: {', '.join(stale)}."
+        )
+
+    return " ".join(messages) or "Verification is incomplete."
+
+
+def _latest_verification_results(
+    state: VerificationToolState,
+) -> dict[str, VerificationResult]:
+    latest_by_command: dict[str, VerificationResult] = {}
+    for result in state.verification_history:
+        latest_by_command[result.command_id] = result
+    return latest_by_command
 
 
 def _get_response_id(response: Any) -> str:

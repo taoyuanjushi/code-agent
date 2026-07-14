@@ -1,46 +1,47 @@
 # coding-agent
 
-一个本地 AI 编程 CLI 工具骨架，目标是逐步实现类似 Codex 的工作流：读取项目上下文、调用模型推理、使用受控工具读取/修改文件、运行验证命令，并给出清晰的执行结果。
+一个使用 Python 实现的本地 AI 编程 CLI。项目目标是逐步建立类似 Codex 的工作流：理解仓库、按需检索代码、通过受控工具修改文件、运行验证命令，并输出可审计的变更与验证结果。
 
-当前主实现使用 Python。
+当前已完成 M1“安全编辑闭环”、M2“更强的项目理解”和 M3“验证闭环”，下一阶段将实现 M4“会话持久化”。
 
-- Python 3.12+ CLI
-- OpenAI Responses API
-- 默认模型：`gpt-5.5`
-- 默认只读模式
-- `--write` 后才允许写入 workspace
-- 代码编辑强制通过 unified diff `apply_patch`，应用前始终展示完整 diff
-- 命令执行默认需要交互确认
-- 初始上下文自动扫描仓库文件列表和关键源码文件
+## 已实现能力
+
+- Python 3.12+ CLI 和 OpenAI Responses API 代理循环。
+- 默认模型为 `gpt-5.5`，默认只读；使用 `--write` 后才允许修改 workspace。
+- 所有代码编辑必须通过 unified diff `apply_patch`，应用前展示完整 diff。
+- 根目录和嵌套 `AGENTS.md` 指令按目录作用域生效。
+- `.gitignore`、默认忽略目录和二进制过滤由统一策略处理。
+- 初始上下文使用受限文件清单和相关性样本，不批量注入源码。
+- 模型可通过 `search_text` 和 `read_many_files` 先搜索、再按需读取。
+- 文本搜索优先使用 `rg`，不可用时自动回退到 Python 实现。
+- 验证命令会从 Python/TypeScript 配置中发现，按任务相关性稳定排序，并通过受控 argv 执行。
+- 失败输出会在行数和字节预算内保留错误上下文；代理可据此重新搜索、修复并重跑失败命令。
+- 命令执行默认要求交互确认，修改结果可通过 `git_status` 和 `git_diff` 检查。
 
 ## 环境要求
 
 - Python 3.12+
 - OpenAI API key
+- 可选：ripgrep，用于加速文本搜索
 
 ## 安装
 
-Windows 上建议明确使用 Python 3.12：
+Windows PowerShell：
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
+Copy-Item .env.example .env
 ```
 
-如果本机 pip 镜像源找不到依赖包，可以临时使用官方 PyPI：
+如果本机镜像缺少依赖，可临时使用官方 PyPI：
 
 ```powershell
 python -m pip install -i https://pypi.org/simple -e ".[dev]"
 ```
 
-复制环境变量模板：
-
-```powershell
-Copy-Item .env.example .env
-```
-
-然后填写：
+在 `.env` 中填写：
 
 ```bash
 OPENAI_API_KEY=your_api_key
@@ -48,105 +49,112 @@ CODING_AGENT_MODEL=gpt-5.5
 CODING_AGENT_REASONING_EFFORT=medium
 ```
 
-Windows PowerShell 也可以直接设置当前会话变量：
+也可以只为当前 PowerShell 会话设置密钥：
 
 ```powershell
 $env:OPENAI_API_KEY="your_api_key"
 ```
 
-## 使用
+## 使用方式
 
 只读分析：
 
 ```powershell
-python -m coding_agent "分析这个项目的结构并指出可以改进的地方"
+python -m coding_agent "分析项目结构并指出可改进之处"
 ```
 
-允许写文件：
+允许修改 workspace：
 
 ```powershell
-python -m coding_agent --write "给这个项目增加一个 README 示例"
+python -m coding_agent --write "修复计算逻辑并运行测试"
 ```
 
-允许自动应用补丁：
+在受控环境中自动批准补丁或命令：
 
 ```powershell
-python -m coding_agent --write --auto-approve-edits "修复一个 Python 类型错误"
+python -m coding_agent --write --auto-approve-edits --auto-approve-commands --max-fix-attempts 3 "修复失败测试"
 ```
 
-允许自动执行命令：
+限制初始上下文样本：
 
 ```powershell
-python -m coding_agent --write --auto-approve-commands "修复测试失败并运行 pytest"
+python -m coding_agent --context-max-files 4 --context-max-bytes-per-file 6000 "定位支付模块"
 ```
 
-测试：
+## 测试与打包
 
 ```powershell
 python -m pytest
+python -m pytest -m "not local_rg"
+python -m pytest tests/test_m3_acceptance.py tests/test_agent_verification.py -q
+python -m pip wheel . -w dist
 ```
 
-如果没有激活虚拟环境，也可以直接用：
+`local_rg` 是依赖本机 ripgrep 的可选 smoke test；常规测试不要求安装 `rg`，也不调用真实模型。
 
-```powershell
-py -3.12 -m pytest
-```
-
-## 当前架构
+## 项目结构
 
 ```text
-coding_agent/
-  cli.py          CLI 入口，解析参数和环境变量
-  config.py       配置加载和校验
-  agent.py        Responses API 代理循环
-  model_client.py OpenAI Responses API 客户端抽象，便于 mock 和替换实现
-  prompts.py      系统提示和任务提示
-  context.py      workspace 文件扫描和上下文采样
-  tools.py        模型工具：读取、补丁、搜索、Git 状态/差异和命令验证
-  search.py       workspace 文本搜索工具
-  patch.py        unified diff 解析、校验和应用
-  path_safety.py  workspace 路径安全校验
-  types.py        共享类型
+src/
+  coding_agent/
+    cli.py           CLI 参数、环境变量和退出码
+    config.py        运行配置加载与校验
+    agent.py         Responses API 工具调用循环
+    model_client.py  模型客户端协议和 OpenAI 实现
+    prompts.py       系统提示、任务提示和工具工作流
+    context.py       受预算约束的仓库清单与初始样本
+    ignore.py        .gitignore、默认忽略和二进制策略
+    instructions.py  根目录及嵌套 AGENTS.md 解析
+    ranking.py       任务相关文件的稳定、可解释排序
+    reader.py        受文件数和字节预算限制的批量读取
+    search.py        rg 优先、Python fallback 的文本搜索
+    verification.py 验证命令发现、排序、安全执行与输出压缩
+    tools.py         工具 schema、参数校验与执行入口
+    patch.py         unified diff 解析、校验和应用
+    path_safety.py   workspace 路径安全校验
+    types.py         共享数据类型
 tests/
-  test_agent.py
-  test_search.py
-  test_tools.py
-  test_integration.py
-  fixtures/failing_project/
-  test_path_safety.py
-  test_patch.py
+  test_<module>.py
+  fixtures/
 docs/
   implementation-plan.md
   m1-learning-and-interview.md
   m2-implementation-guide.md
+  m3-implementation-guide.md
+pyproject.toml
 ```
 
-## 安全模型
-
-第一版只实现基础边界，后续需要继续强化。
+## 安全边界
 
 - 文件路径必须解析在 workspace 内。
-- 默认 `read-only`；`write_file` 已停用，直接写入调用会被拒绝。
-- `apply_patch` 会先解析 unified diff、校验路径和 hunk 上下文，并在写入前展示完整 diff。
-- `search_text` 会限制搜索路径在 workspace 内，并跳过常见构建目录和二进制文件。
-- `run_command` 会拦截明显修改文件的命令，除非开启 `--write`。
-- 命令执行默认需要人工确认。
-- 不自动执行高风险 Git 操作。
+- 被忽略文件和二进制文件不会进入清单、文本搜索或读取结果。
+- 默认 `read-only`；遗留的 `write_file` 调用会被拒绝。
+- `apply_patch` 会校验目标路径和 hunk 上下文，并要求批准。
+- `run_command` 会拦截部分明显修改文件的命令，但当前仍使用 shell 字符串执行。
+- 不自动执行高风险 Git 操作，也不会自动安装依赖。
 
-后续计划加入更严格的命令 allowlist、沙箱进程、审批日志和会话回放。
+当前命令策略不是完整沙箱。更严格的 allowlist、进程隔离、敏感文件保护和审批审计属于后续阶段。
 
-## OpenAI API 路线
+## 开发里程碑
 
-本项目使用 OpenAI Responses API 作为代理循环基础。Responses API 适合把模型输出、工具调用、推理状态和多轮执行组织在同一个接口里；对于更复杂的多代理编排、 tracing、handoff 和长期会话，后续可以评估接入 OpenAI Agents SDK。
+| 阶段 | 状态 | 说明 |
+| --- | --- | --- |
+| M1 | 已完成 | diff-first 编辑、审批、Git 差异和 failing-test 集成流程 |
+| M2 | 已完成 | 统一忽略、AGENTS.md、按需搜索/读取、相关性排序和中型仓库验收 |
+| M3 | 已完成 | Python/TypeScript 命令发现、相关性排序、受控执行、输出压缩、结构化工具和失败后迭代修复 |
+| M4+ | 规划中 | 会话恢复、安全沙箱、流式 UI 和编辑器集成 |
 
-模型调用集中在 `coding_agent/model_client.py`。`agent.py` 只依赖 `ModelClient` 协议，因此单元测试可以注入 fake client，不需要真实 API key。
+详细设计见：
 
-## 开发状态
+- `docs/implementation-plan.md`
+- `docs/m2-implementation-guide.md`
+- `docs/m3-implementation-guide.md`
 
-这是早期版本，不是完整的 Codex 替代品。它已经具备可扩展骨架，但仍缺少：
+## 当前限制
 
-- 更强的 shell 沙箱
-- 流式输出
-- 会话持久化
-- 更完整的测试矩阵
-- IDE/编辑器集成
+本项目仍处于早期阶段，不是完整的 Codex 替代品。当前主要缺口包括：
+
+- 验证闭环状态当前只保存在进程内，退出后不能恢复。
+- 自动修复依赖模型根据结构化失败上下文选择下一步，尚无跨会话策略学习。
+- 尚无 JSONL 会话持久化、恢复和审批审计。
+- 尚无完整 shell 沙箱、流式终端 UI 或 IDE 集成。

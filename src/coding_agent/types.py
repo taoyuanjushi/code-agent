@@ -3,6 +3,7 @@ from typing import Literal
 
 ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh"]
 PermissionMode = Literal["read-only", "workspace-write"]
+MAX_FIX_ATTEMPTS = 10
 
 
 @dataclass(frozen=True)
@@ -16,12 +17,14 @@ class AgentConfig:
     auto_approve_edits: bool
     context_max_files: int
     context_max_bytes_per_file: int
+    max_fix_attempts: int = 3
 
 
 @dataclass(frozen=True)
 class ToolResult:
     ok: bool
     output: str
+    data: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)

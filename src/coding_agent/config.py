@@ -2,7 +2,12 @@ import os
 from argparse import Namespace
 from pathlib import Path
 
-from .types import AgentConfig, PermissionMode, ReasoningEffort
+from .types import (
+    MAX_FIX_ATTEMPTS,
+    AgentConfig,
+    PermissionMode,
+    ReasoningEffort,
+)
 
 VALID_REASONING_EFFORTS: set[str] = {"none", "low", "medium", "high", "xhigh"}
 
@@ -34,6 +39,13 @@ def load_config(options: Namespace) -> AgentConfig:
             8_000,
             "context max bytes per file",
         ),
+        max_fix_attempts=_parse_bounded_positive_int(
+            getattr(options, "max_fix_attempts", None)
+            or os.getenv("CODING_AGENT_MAX_FIX_ATTEMPTS"),
+            3,
+            "max fix attempts",
+            maximum=MAX_FIX_ATTEMPTS,
+        ),
     )
 
 
@@ -49,6 +61,19 @@ def _parse_positive_int(value: str | int | None, fallback: int, label: str) -> i
     if parsed <= 0:
         raise ValueError(f"Invalid {label}: {value}")
 
+    return parsed
+
+
+def _parse_bounded_positive_int(
+    value: str | int | None,
+    fallback: int,
+    label: str,
+    *,
+    maximum: int,
+) -> int:
+    parsed = _parse_positive_int(value, fallback, label)
+    if parsed > maximum:
+        raise ValueError(f"Invalid {label}: {parsed} (maximum {maximum})")
     return parsed
 
 
