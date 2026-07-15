@@ -24,6 +24,7 @@ def test_build_parser_accepts_python_main_options() -> None:
     assert args.max_fix_attempts == "4"
     assert args.task == ["fix tests"]
 
+
 def test_load_config_uses_m2_initial_context_defaults() -> None:
     options = build_parser().parse_args(["inspect"])
 

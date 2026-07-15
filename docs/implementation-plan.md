@@ -146,20 +146,20 @@ coding-agent session replay
 
 当前流程：
 
-1. 收集 workspace snapshot。
-2. 构造 system prompt 和 user prompt。
-3. 调用 Responses API。
-4. 提取模型工具调用。
-5. 执行工具。
-6. 把工具结果传回模型。
-7. 重复直到模型给出最终回答或达到 turn limit。
+1. 创建 session，并在上下文收集前写入 `session.started`。
+2. 收集 workspace snapshot，记录 `context.created`。
+3. 构造提示词，在调用 Responses API 前后记录 `model.requested`、`model.responded` 和 checkpoint。
+4. 规范化模型响应并执行工具批次。
+5. 先持久化工具、验证结果和 checkpoint，再把批次结果传回模型。
+6. 重复直到模型给出最终回答或达到 turn limit。
+7. 将最终报告保存为 artifact，并记录 completed、failed 或 interrupted 终结事件。
 
 后续增强：
 
 - 流式输出。
 - 结构化计划状态。
-- 中断和恢复。
-- 会话持久化。
+- 基于现有事件日志的中断恢复。
+- resume、replay 和会话管理 CLI。
 - 更清晰的 tool call UI。
 - 更严格的输出协议。
 - 失败重试和错误分类。
@@ -480,7 +480,7 @@ run_ripgrep({"pattern": "TODO", "path": "coding_agent"})
 已完成验收契约、验证领域模型、Python/TypeScript 统一命令发现、稳定且可解释的相关性排序、使用 argv 和 `shell=False` 的受控执行、错误上下文压缩、结构化验证工具、验证历史和有次数上限的失败后迭代修复循环。
 建议验收：对小型 Python/TypeScript 项目完成一次可审计的“修复测试”闭环。
 
-### M4：会话持久化
+### M4：会话持久化（已完成）
 
 目标：
 
@@ -494,6 +494,9 @@ run_ripgrep({"pattern": "TODO", "path": "coding_agent"})
 
 - 进程中断后可以恢复。
 - 可以完整审计一次代码修改。
+
+逐步实现、事件模型、安全恢复和测试矩阵见 `docs/m4-implementation-guide.md`。
+M4 已完成事件/检查点模型、显式 codec、JSONL SessionStore、隐私与 artifact 策略、纯 reducer、agent 循环事件接入、集中工具策略、完整审批审计、中断工具对账、workspace guard、跨进程 resume、CLI 会话入口、严格只读 replay、审批查询、最终测试矩阵和 wheel 验收。模型请求按 at-least-once 语义记录，工具批次在继续调用模型前完整落盘；补丁、验证和通用命令的批准、拒绝、异常、参数绑定与执行结果均可追踪。CLI 支持 workspace 内 session 列表、稳定 `latest` 选择、resume、schema version 2 摘要 replay、`--verbose` artifact 展开，以及按 session/action/outcome 过滤审批。只读查询不创建目录或锁，不调用模型、工具、subprocess 或输入函数。最终验收结果为核心会话测试 63 项、恢复/回放/集成测试 24 项、全量测试 406 项全部通过，`compileall` 与 `git diff --check` 通过；版本 `0.3.0` 的 `coding_agent-0.3.0-py3-none-any.whl` 已完成内容、元数据、隔离安装、包导入和控制台入口 smoke 验证。
 
 ### M5：沙箱和权限增强
 
@@ -533,8 +536,8 @@ run_ripgrep({"pattern": "TODO", "path": "coding_agent"})
 2. 完成 M2 项目理解和中型仓库验收。已完成。
 3. 完成 M3 验证命令发现、结构化结果和迭代修复。已完成。
 4. 保持 Python 默认测试和可选 TypeScript/Node smoke test 分离。已完成。
-5. 实现 M4 JSONL session、resume、replay 和审批审计。
-6. 再加入更严格的 shell 沙箱、流式输出、配置文件和 IDE/Web UI。
+5. 完成 M4 JSONL session、审批审计、workspace guard、resume、CLI 会话入口、严格只读 replay、审批查询、最终测试矩阵和 wheel 验收。已完成。
+6. 进入 M5，优先实现更严格的 shell allowlist/denylist、敏感路径保护和可选进程隔离，再扩展流式输出、配置文件和 IDE/Web UI。
 
 ## 12. 已知风险
 

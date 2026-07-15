@@ -1,6 +1,6 @@
 [project]
 name = "coding-agent"
-version = "0.2.0"
+version = "0.3.0"
 description = "A local AI coding agent CLI inspired by Codex, implemented primarily in Python."
 readme = "README.md"
 requires-python = ">=3.12"

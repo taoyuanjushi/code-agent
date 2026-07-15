@@ -413,14 +413,16 @@ def test_repair_loop_counts_patches_and_stops_after_the_limit(
     )
 
     assert initial_patch.ok is True
-    assert initial_patch.data == {
-        "type": "patch_applied",
-        "edit_generation": 1,
-        "failed_command_id": None,
-        "repair_attempts": 0,
-        "max_fix_attempts": 1,
-        "repair_limit_reached": False,
-    }
+    assert initial_patch.data is not None
+    assert initial_patch.data["type"] == "patch_applied"
+    assert initial_patch.data["changed_paths"] == ["value.py"]
+    assert initial_patch.data["edit_generation"] == 1
+    assert initial_patch.data["failed_command_id"] is None
+    assert initial_patch.data["repair_attempts"] == 0
+    assert initial_patch.data["max_fix_attempts"] == 1
+    assert initial_patch.data["repair_limit_reached"] is False
+    assert initial_patch.data["file_changes"][0]["before_sha256"]
+    assert initial_patch.data["file_changes"][0]["after_sha256"]
     assert first_failure.data is not None
     assert first_failure.data["active_failure_command_id"] == "python:pytest"
     assert first_failure.data["repair_attempts"] == 0

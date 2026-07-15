@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+﻿from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -63,7 +63,7 @@ def apply_patch_plan(plan: PatchPlan) -> None:
             continue
 
         ensure_parent_directory(file.absolute_path)
-        file.absolute_path.write_text(file.after_content, encoding="utf-8")
+        file.absolute_path.write_text(file.after_content, encoding="utf-8", newline="")
 
 
 def summarize_patch_plan(plan: PatchPlan) -> str:
