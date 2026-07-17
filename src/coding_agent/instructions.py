@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .ignore import load_ignore_policy
+from .path_safety import is_link_or_reparse_point, resolve_workspace_path
+from .security.path_policy import load_sensitive_path_policy
 
 MAX_AGENT_INSTRUCTION_BYTES = 16 * 1024
 
@@ -24,27 +26,53 @@ def discover_agent_instructions(
 
     root = Path(workspace).resolve()
     ignore_policy = load_ignore_policy(root)
+    sensitive_policy = load_sensitive_path_policy(root)
     instructions: list[AgentInstruction] = []
 
-    for current_directory, directory_names, file_names in os.walk(root, topdown=True):
+    for current_directory, directory_names, file_names in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
         directory = Path(current_directory)
         directory_names.sort()
         file_names.sort()
         directory_names[:] = [
             name
             for name in directory_names
-            if not ignore_policy.is_ignored(directory / name)
+            if not is_link_or_reparse_point(directory / name)
+            and not ignore_policy.is_ignored(directory / name)
+            and sensitive_policy.evaluate(
+                directory / name,
+                operation="read",
+            ).allowed
         ]
 
         if "AGENTS.md" not in file_names:
             continue
 
-        instruction_path = directory / "AGENTS.md"
-        if not _resolves_inside_root(root, instruction_path):
+        requested_instruction_path = directory / "AGENTS.md"
+        try:
+            instruction_path = resolve_workspace_path(
+                root,
+                requested_instruction_path,
+                operation="read",
+                allow_missing=False,
+            )
+        except (OSError, ValueError):
+            continue
+        if not sensitive_policy.evaluate(
+            instruction_path,
+            operation="read",
+        ).allowed:
             continue
 
-        content, truncated = _read_instruction(instruction_path, max_bytes_per_file)
-        relative_path = instruction_path.relative_to(root).as_posix()
+        content, truncated = _read_instruction(
+            root,
+            requested_instruction_path,
+            max_bytes_per_file,
+        )
+        relative_path = requested_instruction_path.relative_to(root).as_posix()
         relative_directory = directory.relative_to(root).as_posix()
         instructions.append(
             AgentInstruction(
@@ -98,7 +126,17 @@ def format_agent_instructions(instructions: list[AgentInstruction]) -> str:
     return "\n\n".join(sections)
 
 
-def _read_instruction(path: Path, max_bytes: int) -> tuple[str, bool]:
+def _read_instruction(
+    root: Path,
+    requested_path: Path,
+    max_bytes: int,
+) -> tuple[str, bool]:
+    path = resolve_workspace_path(
+        root,
+        requested_path,
+        operation="read",
+        allow_missing=False,
+    )
     data = path.read_bytes()
     truncated = len(data) > max_bytes
     content = data[:max_bytes].decode("utf-8", errors="replace")
@@ -119,11 +157,6 @@ def _normalize_relative_path(path: str) -> PurePosixPath:
     ):
         raise ValueError(f"Target path must be workspace-relative: {path}")
     return candidate
-
-
-def _resolves_inside_root(root: Path, path: Path) -> bool:
-    resolved = path.resolve()
-    return resolved == root or root in resolved.parents
 
 
 def _scope_applies(directory: str, target_parts: tuple[str, ...]) -> bool:

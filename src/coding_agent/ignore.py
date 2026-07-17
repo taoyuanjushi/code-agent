@@ -4,6 +4,8 @@ from pathlib import Path
 
 from pathspec import GitIgnoreSpec
 
+from .path_safety import is_link_or_reparse_point, resolve_workspace_path
+
 DEFAULT_IGNORES = frozenset(
     {
         ".git",
@@ -82,33 +84,49 @@ def load_ignore_policy(workspace: str | Path) -> IgnorePolicy:
     rules: list[_GitIgnoreRules] = []
     gitignore_files: list[Path] = []
 
-    for current_directory, directory_names, file_names in os.walk(root, topdown=True):
+    for current_directory, directory_names, file_names in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
         directory = Path(current_directory)
         directory_names.sort()
         file_names.sort()
 
         if ".gitignore" in file_names:
             gitignore_path = directory / ".gitignore"
-            spec = GitIgnoreSpec.from_lines(
-                gitignore_path.read_text(
+            try:
+                readable_gitignore = resolve_workspace_path(
+                    root,
+                    gitignore_path,
+                    operation="read",
+                    allow_missing=False,
+                )
+                rules_text = readable_gitignore.read_text(
                     encoding="utf-8-sig",
                     errors="replace",
-                ).splitlines()
-            )
-            rules.append(
-                _GitIgnoreRules(
-                    path=gitignore_path,
-                    directory=directory,
-                    spec=spec,
                 )
-            )
-            gitignore_files.append(gitignore_path)
+            except (OSError, ValueError):
+                pass
+            else:
+                spec = GitIgnoreSpec.from_lines(rules_text.splitlines())
+                rules.append(
+                    _GitIgnoreRules(
+                        path=gitignore_path,
+                        directory=directory,
+                        spec=spec,
+                    )
+                )
+                gitignore_files.append(gitignore_path)
 
         retained_directories: list[str] = []
         for name in directory_names:
             candidate = directory / name
             relative = candidate.relative_to(root)
-            if any(part in DEFAULT_IGNORES for part in relative.parts):
+            if (
+                is_link_or_reparse_point(candidate)
+                or any(part in DEFAULT_IGNORES for part in relative.parts)
+            ):
                 continue
             if _matches_gitignore_rules(tuple(rules), candidate, is_directory=True):
                 continue

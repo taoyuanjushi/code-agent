@@ -77,15 +77,29 @@ class FixFailingTestClient:
             assert "return left + right" in result["output"]
             response = _tool_call_response(
                 "response-4",
-                "run_command",
-                {"command": f'"{sys.executable}" -m pytest -q'},
-                "call-test",
+                "discover_verification_commands",
+                {"task": "Fix the failing test and verify it."},
+                "call-discover",
             )
         elif self.step == 3:
             assert result["ok"] is True
+            command_ids = [
+                command["id"]
+                for command in result["data"]["commands"]
+            ]
+            assert "python:pytest" in command_ids
+            response = _tool_call_response(
+                "response-5",
+                "run_verification",
+                {"command_id": "python:pytest"},
+                "call-test",
+            )
+        elif self.step == 4:
+            assert result["ok"] is True
             assert "1 passed" in result["output"]
+            assert result["data"]["rule_id"] == "allow.discovered_verification"
             response = {
-                "id": "response-5",
+                "id": "response-6",
                 "output_text": "Fixed calculator.py and verified the test passes.",
                 "output": [],
             }
@@ -101,6 +115,10 @@ def test_agent_fixes_failing_test_and_reports_git_diff(tmp_path: Path) -> None:
     workspace = tmp_path / "project"
     shutil.copytree(fixture, workspace)
     (workspace / "test_calculator.py.txt").rename(workspace / "test_calculator.py")
+    (workspace / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n",
+        encoding="utf-8",
+    )
 
     failing = subprocess.run(
         [sys.executable, "-m", "pytest", "-q"],
@@ -129,7 +147,7 @@ def test_agent_fixes_failing_test_and_reports_git_diff(tmp_path: Path) -> None:
     answer = run_agent("Fix the failing test and verify it.", config, model_client=client)
 
     assert answer == "Fixed calculator.py and verified the test passes."
-    assert client.step == 4
+    assert client.step == 5
     assert (workspace / "calculator.py").read_text(encoding="utf-8").endswith(
         "return left + right\n"
     )

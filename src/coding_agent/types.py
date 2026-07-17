@@ -3,6 +3,7 @@ from typing import Literal
 
 ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh"]
 PermissionMode = Literal["read-only", "workspace-write"]
+SandboxMode = Literal["none", "auto", "docker"]
 MAX_FIX_ATTEMPTS = 10
 
 
@@ -18,6 +19,10 @@ class AgentConfig:
     context_max_files: int
     context_max_bytes_per_file: int
     max_fix_attempts: int = 3
+    sandbox_mode: SandboxMode = "none"
+    sandbox_image: str = "python:3.12-slim"
+    sandbox_image_digest: str | None = None
+    full_auto: bool = False
 
 
 @dataclass(frozen=True)

@@ -9,6 +9,8 @@ from typing import Any
 
 import pytest
 
+from tests.process_fakes import patch_verification_runner
+
 import coding_agent.agent as agent_module
 import coding_agent.tools as tools_module
 import coding_agent.verification as verification_module
@@ -301,11 +303,7 @@ def test_medium_repository_resumes_failed_verification_and_applies_patch_once(
             ),
         )
 
-    monkeypatch.setattr(
-        verification_module.subprocess,
-        "run",
-        fake_verification_run,
-    )
+    patch_verification_runner(monkeypatch, fake_verification_run)
 
     original_apply_patch_plan = tools_module.apply_patch_plan
     patch_applications = 0

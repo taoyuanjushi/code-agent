@@ -303,3 +303,23 @@ def test_search_text_native_rg_smoke(
         ("native.txt", 1, 1)
     ]
 
+
+
+def test_python_fallback_does_not_recurse_into_symlink_directories(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "local.txt").write_text("needle local\n", encoding="utf-8")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("needle outside\n", encoding="utf-8")
+    link = tmp_path / "linked"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable on this platform: {exc}")
+
+    matches = search_text(workspace=str(tmp_path), pattern="needle")
+
+    assert [(match.path, match.preview) for match in matches] == [
+        ("local.txt", "needle local")
+    ]

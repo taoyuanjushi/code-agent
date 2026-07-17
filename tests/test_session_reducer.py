@@ -197,6 +197,62 @@ def test_approval_requires_a_started_known_call_and_is_preserved() -> None:
     assert state.approvals == (decision,)
 
 
+def test_preflight_security_rejection_finishes_without_approval() -> None:
+    events, state = _state_awaiting_tool(tool_name="run_command")
+    started = _event(
+        "tool.started",
+        {"call_id": "call-read"},
+        events=tuple(events),
+    )
+    state = reduce_event(state, started)
+    events.append(started)
+    finished = _event(
+        "tool.finished",
+        {
+            "call_id": "call-read",
+            "output": {"ok": False},
+            "execution": {
+                "status": "denied",
+                "disposition": "deny",
+                "requires_approval": False,
+            },
+        },
+        events=tuple(events),
+    )
+
+    state = reduce_event(state, finished)
+
+    assert state.completed_call_ids == frozenset({"call-read"})
+    assert state.approvals == ()
+
+
+def test_approval_cannot_be_bypassed_by_an_unrelated_failed_execution() -> None:
+    events, state = _state_awaiting_tool(tool_name="run_command")
+    started = _event(
+        "tool.started",
+        {"call_id": "call-read"},
+        events=tuple(events),
+    )
+    state = reduce_event(state, started)
+    events.append(started)
+    finished = _event(
+        "tool.finished",
+        {
+            "call_id": "call-read",
+            "output": {"ok": False},
+            "execution": {
+                "status": "failed",
+                "disposition": "approval_required",
+                "requires_approval": True,
+            },
+        },
+        events=tuple(events),
+    )
+
+    with pytest.raises(SessionReductionError, match="requires approval"):
+        reduce_event(state, finished)
+
+
 def test_approval_rejects_wrong_action_hash_and_duplicate_call_decisions() -> None:
     events, state = _state_awaiting_tool(tool_name="apply_patch")
     started = _event(

@@ -4,6 +4,12 @@ from dataclasses import replace
 from typing import Mapping, cast
 
 from ..approvals import validate_approval_decision
+from ..security.models import (
+    CommandPolicyDecision,
+    SandboxCapability,
+    SecureExecutionResult,
+)
+from ..tool_outputs import thaw_json
 from ..tool_policy import (
     TOOL_EFFECTS,
     TOOL_POLICIES,
@@ -70,6 +76,12 @@ def reduce_event(
             "tool.recovered": _recover_tool,
             "approval.decided": _record_approval,
             "verification.recorded": _record_verification,
+            "security.policy_evaluated": _record_security_event,
+            "sandbox.capability_checked": _record_security_event,
+            "sandbox.snapshot_created": _record_security_event,
+            "sandbox.started": _record_security_event,
+            "sandbox.finished": _record_security_event,
+            "sandbox.cleanup_failed": _record_security_event,
             "checkpoint.saved": _validate_checkpoint,
         }
         if event.type == "session.started":
@@ -347,13 +359,32 @@ def _complete_tool_call(
                 raise SessionReductionError(
                     "read-only recovery must use safe_retry without approval."
                 )
+        elif call.effect == "process" and reason == "sandbox_reconciled":
+            if requires_reapproval:
+                raise SessionReductionError(
+                    "reconciled sandbox retry must not require approval."
+                )
         elif not requires_reapproval:
             raise SessionReductionError(
                 "side-effecting recovery retries require explicit reapproval."
             )
         calls = list(state.pending_tool_calls)
         calls[index] = replace(call, started=False)
-        return _advance(state, event, pending_tool_calls=tuple(calls))
+        approvals = (
+            tuple(
+                decision
+                for decision in state.approvals
+                if decision.call_id != call_id
+            )
+            if call.effect == "process" and reason == "sandbox_reconciled"
+            else state.approvals
+        )
+        return _advance(
+            state,
+            event,
+            pending_tool_calls=tuple(calls),
+            approvals=approvals,
+        )
 
     policy = get_tool_policy(call.name)
     call_approvals = tuple(
@@ -361,7 +392,11 @@ def _complete_tool_call(
         for decision in state.approvals
         if decision.call_id == call_id
     )
-    if policy.approval_required and not call_approvals:
+    if (
+        policy.approval_required
+        and not call_approvals
+        and not _is_preflight_security_rejection(data)
+    ):
         raise SessionReductionError(
             f"tool call {call_id!r} requires approval.decided before completion."
         )
@@ -401,6 +436,17 @@ def _complete_tool_call(
         completed_call_ids=completed,
         verification_state=verification_state,
         touched_file_hashes=touched_file_hashes,
+    )
+
+
+def _is_preflight_security_rejection(data: Mapping[str, JsonValue]) -> bool:
+    execution = data.get("execution")
+    if not isinstance(execution, Mapping):
+        return False
+    return (
+        execution.get("status") in {"denied", "sandbox_unavailable"}
+        and execution.get("disposition") in {"deny", "sandbox_required"}
+        and execution.get("requires_approval") is False
     )
 
 
@@ -512,6 +558,51 @@ def _record_verification(
         mutable_state.record_verification(result)
         verification_state = verification_tool_state_to_dict(mutable_state)
     return _advance(state, event, verification_state=verification_state)
+
+
+def _record_security_event(
+    state: AgentSessionState,
+    event: SessionEvent,
+) -> AgentSessionState:
+    _require_running(state, event)
+    if state.phase != "awaiting_tools":
+        raise SessionReductionError(
+            f"{event.type} is invalid while phase is {state.phase!r}."
+        )
+    call_id = _required_string(event.payload, "call_id")
+    _, call = _pending_call(state, call_id)
+    if not call.started:
+        raise SessionReductionError(
+            f"{event.type} requires the corresponding tool.started event."
+        )
+
+    if event.type == "security.policy_evaluated":
+        CommandPolicyDecision.from_dict(
+            cast(Mapping[str, object], thaw_json(event.payload["policy"]))
+        )
+    elif event.type == "sandbox.capability_checked":
+        SandboxCapability.from_dict(
+            _mapping(event.payload["capability"], "capability")
+        )
+    elif event.type == "sandbox.snapshot_created":
+        snapshot = _mapping(event.payload["snapshot"], "snapshot")
+        _required_string(snapshot, "manifest_sha256")
+        _integer(snapshot.get("file_count"), "snapshot.file_count")
+        _integer(snapshot.get("total_bytes"), "snapshot.total_bytes")
+    elif event.type == "sandbox.started":
+        if event.payload.get("backend") != "docker":
+            raise SessionReductionError("sandbox.started backend must be docker.")
+        if event.payload.get("network_mode") != "none":
+            raise SessionReductionError("sandbox.started network_mode must be none.")
+        _required_string(event.payload, "container_name")
+        _required_string(event.payload, "image_digest")
+    elif event.type == "sandbox.finished":
+        SecureExecutionResult.from_dict(
+            cast(Mapping[str, object], thaw_json(event.payload["result"]))
+        )
+    elif event.type == "sandbox.cleanup_failed":
+        _required_string(event.payload, "reason")
+    return _advance(state, event)
 
 
 def _validate_checkpoint(

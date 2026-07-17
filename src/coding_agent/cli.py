@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 
 from .agent import AgentRunReport, resume_agent_with_report, run_agent_with_report
 from .config import load_config
+from .security.docker_backend import DockerSandboxBackend
 from .sessions.query import (
     build_session_list_payload,
     build_session_replay_payload,
@@ -18,6 +20,7 @@ from .sessions.query import (
 )
 from .sessions.replay import build_approval_query_payload
 from .sessions.store import SessionStore
+from .types import AgentConfig
 
 CliMode = Literal["new", "resume", "replay", "list", "approvals"]
 
@@ -33,6 +36,9 @@ _NEW_TASK_OPTIONS = (
     ("write", "--write"),
     ("auto_approve_edits", "--auto-approve-edits"),
     ("auto_approve_commands", "--auto-approve-commands"),
+    ("sandbox", "--sandbox"),
+    ("sandbox_image", "--sandbox-image"),
+    ("full_auto", "--full-auto"),
     ("max_fix_attempts", "--max-fix-attempts"),
     ("context_max_files", "--context-max-files"),
     ("context_max_bytes_per_file", "--context-max-bytes-per-file"),
@@ -107,7 +113,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--auto-approve-commands",
         action="store_true",
-        help="run shell commands without interactive approval",
+        help="approve commands automatically only with a pinned Docker sandbox",
+    )
+    parser.add_argument(
+        "--sandbox",
+        choices=("none", "auto", "docker"),
+        help="sandbox mode (default: auto)",
+    )
+    parser.add_argument(
+        "--sandbox-image",
+        metavar="IMAGE",
+        help="local Docker image used for sandbox execution",
+    )
+    parser.add_argument(
+        "--full-auto",
+        action="store_true",
+        help="enable writes and automatic approvals using pinned Docker only",
     )
     parser.add_argument(
         "--max-fix-attempts",
@@ -169,12 +190,11 @@ def main(argv: list[str] | None = None) -> int:
             _print_approval_query(payload, as_json=args.json)
             return 0
 
-        if not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError(
-                "OPENAI_API_KEY is not set. Copy .env.example to .env and fill it in."
-            )
-
         if mode == "resume":
+            if not os.getenv("OPENAI_API_KEY"):
+                raise RuntimeError(
+                    "OPENAI_API_KEY is not set. Copy .env.example to .env and fill it in."
+                )
             store = SessionStore(workspace)
             session_id = resolve_session_selector(store, args.resume)
             print("coding-agent")
@@ -189,12 +209,17 @@ def main(argv: list[str] | None = None) -> int:
             _print_agent_report(report)
             return 0
 
-        config = load_config(args)
+        config = _preflight_sandbox(load_config(args))
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set. Copy .env.example to .env and fill it in."
+            )
         task = " ".join(args.task)
         print("coding-agent")
         print(f"workspace: {config.workspace}")
         print(f"model: {config.model}")
         print(f"mode: {config.permission_mode}")
+        print(f"sandbox: {config.sandbox_mode}")
 
         report = run_agent_with_report(task, config)
         _print_agent_report(report)
@@ -202,6 +227,38 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+
+def _preflight_sandbox(config: AgentConfig) -> AgentConfig:
+    """Resolve unattended execution to a pinned local Docker capability."""
+
+    unattended_commands = config.full_auto or config.auto_approve_commands
+    if config.sandbox_mode == "none":
+        if unattended_commands:
+            raise CliUsageError(
+                "--full-auto and --auto-approve-commands require a Docker sandbox."
+            )
+        return config
+
+    backend = DockerSandboxBackend(image_reference=config.sandbox_image)
+    if config.sandbox_mode == "auto" and not unattended_commands:
+        return config
+
+    capability = backend.probe_capability(config.workspace)
+    if not capability.available or capability.image_digest is None:
+        raise RuntimeError(
+            "Docker sandbox preflight failed: "
+            + (capability.reason or "the local image digest is unavailable.")
+        )
+    if capability.image_reference != config.sandbox_image:
+        raise RuntimeError(
+            "Docker sandbox preflight returned a different image reference."
+        )
+    return replace(
+        config,
+        sandbox_mode="docker",
+        sandbox_image_digest=capability.image_digest,
+    )
 
 
 def _select_mode(args: argparse.Namespace) -> CliMode:

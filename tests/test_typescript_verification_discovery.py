@@ -36,6 +36,18 @@ def _write_package(workspace: Path, package: object) -> None:
     )
 
 
+def _create_symlink_or_skip(
+    link: Path,
+    target: Path,
+    *,
+    is_directory: bool = False,
+) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=is_directory)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+
 def test_discovers_fixture_scripts_in_stable_kind_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -70,6 +82,36 @@ def test_discovers_fixture_scripts_in_stable_kind_order(
     assert all(command.available for command in result.commands)
     assert result.workspace == str(FIXTURE.resolve())
     assert result.warnings == ()
+    assert result.errors == ()
+
+
+def test_discovery_ignores_external_package_and_lockfile_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-typescript"
+    outside.mkdir()
+    _write_package(
+        outside,
+        {"scripts": {"test": "vitest run"}},
+    )
+    (outside / "pnpm-lock.yaml").write_text(
+        "lockfileVersion: '9.0'\n",
+        encoding="utf-8",
+    )
+    _create_symlink_or_skip(
+        tmp_path / "package.json",
+        outside / "package.json",
+    )
+    _create_symlink_or_skip(
+        tmp_path / "pnpm-lock.yaml",
+        outside / "pnpm-lock.yaml",
+    )
+    _set_available_executables(monkeypatch, "pnpm")
+
+    result = discover_typescript_verification_commands(tmp_path)
+
+    assert result.commands == ()
     assert result.errors == ()
 
 
@@ -335,11 +377,13 @@ _LOCAL_NODE_PATH = shutil.which("node")
 @pytest.mark.local_node
 @pytest.mark.skipif(_LOCAL_NODE_PATH is None, reason="Node.js is not installed")
 def test_local_node_controlled_runner_smoke(tmp_path: Path) -> None:
+    script = tmp_path / "node-smoke.js"
+    script.write_text("console.log('node-smoke-ok')\n", encoding="utf-8")
     command = create_verification_command(
         workspace=tmp_path,
         command_id="node:test",
         kind="test",
-        argv=(_LOCAL_NODE_PATH or "node", "-e", "console.log('node-smoke-ok')"),
+        argv=(_LOCAL_NODE_PATH or "node", str(script)),
         source="optional local Node.js smoke test",
         available=True,
     )

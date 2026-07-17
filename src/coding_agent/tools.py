@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 import subprocess
-import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,8 +19,14 @@ from .instructions import (
     format_agent_instructions,
     instructions_for_path,
 )
-from .patch import apply_patch_plan, plan_patch, summarize_patch_plan
-from .path_safety import resolve_inside_workspace
+from .patch import (
+    FilePatchPlan,
+    PatchPlan,
+    apply_patch_plan,
+    plan_patch,
+    summarize_patch_plan,
+)
+from .path_safety import resolve_workspace_path
 from .reader import (
     DEFAULT_MAX_BYTES_PER_FILE,
     DEFAULT_MAX_FILES,
@@ -29,6 +35,25 @@ from .reader import (
     read_many_files,
 )
 from .search import format_search_matches, search_text
+from .security.command_policy import (
+    evaluate_command_policy,
+    format_command_policy_block,
+)
+from .security.docker_backend import DockerSandboxBackend
+from .security.models import (
+    MAX_COMMAND_ARGUMENTS,
+    CommandPolicyDecision,
+    CommandSpec,
+    ExecutionLimits,
+    SandboxCapability,
+    SandboxExecutionPlan,
+)
+from .security.path_policy import (
+    SENSITIVE_PATH_DENIAL_REASON,
+    load_sensitive_path_policy,
+)
+from .security.process_runner import HostProcessResult, run_host_process
+from .security.sandbox import SandboxExecutionOutcome
 from .tool_policy import hash_tool_arguments
 from .types import MAX_FIX_ATTEMPTS, AgentConfig, ToolResult
 from .verification import (
@@ -41,7 +66,9 @@ from .verification import (
     VerificationCommand,
     VerificationDiscoveryResult,
     VerificationResult,
+    build_verification_command_spec,
     discover_verification_commands,
+    evaluate_verification_command_policy,
     run_verification_command,
 )
 
@@ -55,6 +82,8 @@ MAX_READ_TOTAL_BYTES = 4_194_304
 MAX_SEARCH_RESULTS = 1_000
 MAX_COMMAND_TIMEOUT_MS = 300_000
 MAX_GLOB_PATTERNS = 100
+
+SecurityEventHandler = Callable[[str, Mapping[str, object]], None]
 
 
 @dataclass
@@ -301,12 +330,23 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "run_command",
-        "description": "Run a shell command in the workspace and return stdout/stderr.",
+        "description": "Run a structured command in the workspace and return stdout/stderr. Arguments are passed directly without a shell.",
         "parameters": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "command": {"type": "string", "description": "Command to run."},
+                "argv": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_COMMAND_ARGUMENTS,
+                    "items": {"type": "string", "minLength": 1},
+                    "description": "Command executable and arguments. Each item is passed directly without a shell.",
+                },
+                "cwd": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Optional workspace-relative working directory. Defaults to .",
+                },
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1,
@@ -314,7 +354,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "description": "Timeout in milliseconds. Defaults to 30000.",
                 },
             },
-            "required": ["command"],
+            "required": ["argv"],
         },
     },
 ]
@@ -328,6 +368,8 @@ def execute_tool(
     state: VerificationToolState | None = None,
     approval_handler: ApprovalHandler | None = None,
     call_id: str | None = None,
+    session_id: str | None = None,
+    security_event_handler: SecurityEventHandler | None = None,
 ) -> ToolResult:
     try:
         args = _parse_tool_arguments(raw_arguments)
@@ -367,9 +409,15 @@ def execute_tool(
                 approval_handler=handler,
                 call_id=effective_call_id,
                 arguments_sha256=arguments_sha256,
+                session_id=session_id,
+                security_event_handler=security_event_handler,
             )
         if name == "git_status":
-            return _run_shell_command("git status --short", config.workspace, 30_000)
+            return _run_internal_argv_command(
+                ("git", "status", "--short"),
+                config,
+                purpose="Inspect concise Git status",
+            )
         if name == "git_diff":
             return _git_diff_tool(config)
         if name == "run_command":
@@ -379,6 +427,8 @@ def execute_tool(
                 approval_handler=handler,
                 call_id=effective_call_id,
                 arguments_sha256=arguments_sha256,
+                session_id=session_id,
+                security_event_handler=security_event_handler,
             )
 
         return ToolResult(ok=False, output=f"Unknown tool: {name}")
@@ -407,8 +457,18 @@ def _read_file_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
     )
 
     root = Path(config.workspace).resolve()
-    full_path = resolve_inside_workspace(root, relative_path)
+    full_path = resolve_workspace_path(
+        root,
+        relative_path,
+        operation="read",
+        allow_missing=True,
+    )
     normalized_path = full_path.relative_to(root).as_posix()
+    sensitive_policy = load_sensitive_path_policy(root)
+    sensitive_decision = sensitive_policy.evaluate(full_path, operation="read")
+    if not sensitive_decision.allowed:
+        return _sensitive_path_denied_result(normalized_path, operation="read")
+
     ignore_policy = load_ignore_policy(config.workspace)
     is_ignored = ignore_policy.is_ignored(full_path)
     is_visible_instruction = (
@@ -420,6 +480,12 @@ def _read_file_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
     if ignore_policy.is_binary(full_path):
         return ToolResult(ok=False, output=f"Binary file cannot be read as text: {normalized_path}")
 
+    full_path = resolve_workspace_path(
+        root,
+        relative_path,
+        operation="read",
+        allow_missing=False,
+    )
     data = full_path.read_bytes()
     content = data[:max_bytes].decode("utf-8", errors="replace")
     suffix = f"\n\n[Truncated after {max_bytes} bytes]" if len(data) > max_bytes else ""
@@ -514,10 +580,7 @@ def _apply_patch_tool(
     patch = _require_string(args.get("patch"), "patch")
     patch_plan = plan_patch(config.workspace, patch)
     summary = summarize_patch_plan(patch_plan)
-    before_hashes = {
-        file.path: _hash_file_or_none(file.absolute_path)
-        for file in patch_plan.files
-    }
+    before_hashes = _hash_patch_plan_files(patch_plan)
     expected_after_hashes = {
         file.path: (
             None
@@ -553,20 +616,14 @@ def _apply_patch_tool(
     if not _approval_granted(approval_handler, request):
         return ToolResult(ok=False, output="User declined patch application.")
 
-    current_before_hashes = {
-        file.path: _hash_file_or_none(file.absolute_path)
-        for file in patch_plan.files
-    }
+    current_before_hashes = _hash_patch_plan_files(patch_plan)
     if current_before_hashes != before_hashes:
         raise RuntimeError(
             "Workspace changed after patch review; refusing to apply the approved diff."
         )
 
     apply_patch_plan(patch_plan)
-    after_hashes = {
-        file.path: _hash_file_or_none(file.absolute_path)
-        for file in patch_plan.files
-    }
+    after_hashes = _hash_patch_plan_files(patch_plan)
     if after_hashes != expected_after_hashes:
         raise RuntimeError(
             "Applied patch content does not match the audited after hashes."
@@ -600,7 +657,17 @@ def _apply_patch_tool(
 def _list_files_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
     relative_path = _optional_string_argument(args, "path", default=".")
     root = Path(config.workspace).resolve()
-    full_path = resolve_inside_workspace(root, relative_path)
+    full_path = resolve_workspace_path(
+        root,
+        relative_path,
+        operation="list",
+        allow_missing=False,
+    )
+    normalized_path = full_path.relative_to(root).as_posix()
+    sensitive_policy = load_sensitive_path_policy(root)
+    if not sensitive_policy.evaluate(full_path, operation="list").allowed:
+        return _sensitive_path_denied_result(normalized_path, operation="list")
+
     ignore_policy = load_ignore_policy(config.workspace)
     if ignore_policy.is_ignored(full_path):
         return ToolResult(ok=False, output=f"Path is ignored: {relative_path}")
@@ -609,6 +676,7 @@ def _list_files_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
         f"{'dir ' if entry.is_dir() else 'file'} {entry.name}"
         for entry in full_path.iterdir()
         if not ignore_policy.is_ignored(entry)
+        and sensitive_policy.evaluate(entry, operation="list").allowed
     )
     return ToolResult(ok=True, output="\n".join(entries) or "(empty directory)")
 
@@ -616,6 +684,18 @@ def _list_files_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
 def _search_text_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
     pattern = _require_string(args.get("pattern"), "pattern")
     relative_path = _optional_string_argument(args, "path", default=".")
+    root = Path(config.workspace).resolve()
+    full_path = resolve_workspace_path(
+        root,
+        relative_path,
+        operation="search",
+        allow_missing=True,
+    )
+    normalized_path = full_path.relative_to(root).as_posix()
+    sensitive_policy = load_sensitive_path_policy(root)
+    if not sensitive_policy.evaluate(full_path, operation="search").allowed:
+        return _sensitive_path_denied_result(normalized_path, operation="search")
+
     matches = search_text(
         workspace=config.workspace,
         pattern=pattern,
@@ -636,6 +716,21 @@ def _search_text_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
     )
 
     return ToolResult(ok=True, output=format_search_matches(matches))
+
+
+def _sensitive_path_denied_result(path: str, *, operation: str) -> ToolResult:
+    return ToolResult(
+        ok=False,
+        output=(
+            f"{SENSITIVE_PATH_DENIAL_REASON}: "
+            f"{operation} access to sensitive workspace path {path!r} is denied."
+        ),
+        data={
+            "reason": SENSITIVE_PATH_DENIAL_REASON,
+            "operation": operation,
+            "path": path,
+        },
+    )
 
 
 def _discover_verification_tool(
@@ -690,6 +785,8 @@ def _run_verification_tool(
     approval_handler: ApprovalHandler,
     call_id: str,
     arguments_sha256: str,
+    session_id: str | None,
+    security_event_handler: SecurityEventHandler | None,
 ) -> ToolResult:
     _reject_unknown_arguments(
         args,
@@ -727,8 +824,67 @@ def _run_verification_tool(
         default=DEFAULT_VERIFICATION_TIMEOUT_MS,
         maximum=MAX_VERIFICATION_TIMEOUT_MS,
     )
+    max_output_bytes = _require_positive_int(
+        args,
+        "max_output_bytes",
+        default=DEFAULT_VERIFICATION_MAX_OUTPUT_BYTES,
+        maximum=MAX_VERIFICATION_OUTPUT_BYTES,
+    )
+    max_output_lines = _require_positive_int(
+        args,
+        "max_output_lines",
+        default=DEFAULT_VERIFICATION_MAX_OUTPUT_LINES,
+        maximum=MAX_VERIFICATION_OUTPUT_LINES,
+    )
+    selected_command = next(
+        (
+            command
+            for command in current_state.discovery.commands
+            if command.id == command_id
+        ),
+        None,
+    )
+    policy_decision = _verification_policy_decision_or_none(
+        config,
+        command_id=command_id,
+        command=selected_command,
+        discovery=current_state.discovery,
+        timeout_ms=timeout_ms,
+        max_output_bytes=max_output_bytes,
+        max_output_lines=max_output_lines,
+    )
+    if policy_decision is not None:
+        _emit_security_event(
+            security_event_handler,
+            "security.policy_evaluated",
+            {"policy": policy_decision.to_dict()},
+        )
+    use_docker = (
+        policy_decision is not None
+        and _should_use_docker(config, policy_decision)
+    )
 
     def approve(command: VerificationCommand) -> bool:
+        nonlocal policy_decision
+        if policy_decision is None:
+            policy_decision = evaluate_verification_command_policy(
+                config.workspace,
+                command_id=command_id,
+                command=command,
+                discovery=current_state.discovery,
+                timeout_ms=timeout_ms,
+                max_output_bytes=max_output_bytes,
+                max_output_lines=max_output_lines,
+            )
+        command_spec = build_verification_command_spec(
+            config.workspace,
+            command_id=command_id,
+            command=command,
+            discovery=current_state.discovery,
+            timeout_ms=timeout_ms,
+            max_output_bytes=max_output_bytes,
+            max_output_lines=max_output_lines,
+        )
         request = ApprovalRequest(
             call_id=call_id,
             action="run_verification",
@@ -738,39 +894,118 @@ def _run_verification_tool(
                 "command_id": command.id,
                 "kind": command.kind,
                 "argv": list(command.argv),
-                "cwd": command.cwd,
+                "cwd": command_spec.cwd,
                 "timeout_ms": timeout_ms,
                 "shell": False,
+                "backend": "docker" if use_docker else "host",
+                "sandboxed": use_docker,
+                "network_mode": "none" if use_docker else "host",
+                "image_reference": config.sandbox_image if use_docker else None,
+                "image_digest": (
+                    config.sandbox_image_digest if use_docker else None
+                ),
+                **_command_policy_fields(policy_decision),
             },
         )
         return _approval_granted(approval_handler, request)
+
+    if (
+        selected_command is not None
+        and selected_command.available
+        and policy_decision is not None
+        and use_docker
+    ):
+        approval_granted = False
+        if policy_decision.requires_approval:
+            if not approve(selected_command):
+                return _verification_not_executed_result(
+                    selected_command,
+                    current_state,
+                    attempt=attempt,
+                    timeout_ms=timeout_ms,
+                    policy_decision=policy_decision,
+                    status="approval_declined",
+                    output="User declined verification command execution.",
+                    backend="docker",
+                    workspace=config.workspace,
+                )
+            approval_granted = True
+
+        command_spec = build_verification_command_spec(
+            config.workspace,
+            command_id=command_id,
+            command=selected_command,
+            discovery=current_state.discovery,
+            timeout_ms=timeout_ms,
+            max_output_bytes=max_output_bytes,
+            max_output_lines=max_output_lines,
+        )
+        execution = _execute_docker_command(
+            config,
+            command_spec,
+            policy_decision,
+            approval_granted=approval_granted,
+            session_id=session_id,
+            call_id=call_id,
+            security_event_handler=security_event_handler,
+        )
+        if isinstance(execution, ToolResult):
+            return _verification_not_executed_result(
+                selected_command,
+                current_state,
+                attempt=attempt,
+                timeout_ms=timeout_ms,
+                policy_decision=policy_decision,
+                status=str((execution.data or {}).get("status", "internal_error")),
+                output=execution.output,
+                backend="docker",
+                workspace=config.workspace,
+                execution_data=execution.data,
+            )
+        return _docker_verification_result(
+            execution,
+            selected_command,
+            current_state,
+            attempt=attempt,
+            timeout_ms=timeout_ms,
+            workspace=config.workspace,
+        )
 
     result = run_verification_command(
         config.workspace,
         command_id=command_id,
         discovery=current_state.discovery,
         timeout_ms=timeout_ms,
-        max_output_bytes=_require_positive_int(
-            args,
-            "max_output_bytes",
-            default=DEFAULT_VERIFICATION_MAX_OUTPUT_BYTES,
-            maximum=MAX_VERIFICATION_OUTPUT_BYTES,
-        ),
-        max_output_lines=_require_positive_int(
-            args,
-            "max_output_lines",
-            default=DEFAULT_VERIFICATION_MAX_OUTPUT_LINES,
-            maximum=MAX_VERIFICATION_OUTPUT_LINES,
-        ),
+        max_output_bytes=max_output_bytes,
+        max_output_lines=max_output_lines,
         attempt=attempt,
         approval_callback=approve,
     )
     current_state.record_verification(result)
+    host_backend = (
+        "host"
+        if policy_decision is not None
+        and policy_decision.disposition in {"allow_host", "approval_required"}
+        else None
+    )
     data = _verification_result_data(
         result,
         state=current_state,
         timeout_ms=timeout_ms,
+        policy_decision=policy_decision,
+        workspace=config.workspace,
+        backend=host_backend,
     )
+    if policy_decision is not None and policy_decision.disposition in {
+        "deny",
+        "sandbox_required",
+    }:
+        data["verification_status"] = result.status
+        data["status"] = (
+            "denied"
+            if policy_decision.disposition == "deny"
+            else "sandbox_unavailable"
+        )
     return ToolResult(
         ok=result.status == "passed",
         output=result.output or f"Verification {result.status}: {command_id}",
@@ -796,20 +1031,35 @@ def _verification_result_data(
     *,
     state: VerificationToolState,
     timeout_ms: int,
+    policy_decision: CommandPolicyDecision | None,
+    workspace: str | Path,
+    backend: str | None,
 ) -> dict[str, object]:
-    return {
-        "type": "verification_result",
+    workspace_root = Path(workspace).resolve()
+    result_cwd = Path(result.cwd).resolve()
+    try:
+        relative_cwd = result_cwd.relative_to(workspace_root).as_posix()
+    except ValueError:
+        relative_cwd = result.cwd
+    data: dict[str, object] = {
+        "type": "secure_command_result",
         "command_id": result.command_id,
         "kind": result.kind,
         "status": result.status,
         "argv": list(result.argv),
-        "cwd": result.cwd,
+        "cwd": relative_cwd,
         "exit_code": result.exit_code,
         "duration_ms": result.duration_ms,
         "timeout_ms": timeout_ms,
         "timed_out": result.status == "timed_out",
         "shell": False,
-        "truncated": result.truncated,
+        "backend": backend,
+        "sandboxed": backend == "docker",
+        "image_digest": None,
+        "network_mode": (
+            "none" if backend == "docker" else "host" if backend == "host" else None
+        ),
+        "output_truncated": result.truncated,
         "omitted_lines": result.omitted_lines,
         "omitted_bytes": result.omitted_bytes,
         "attempt": result.attempt,
@@ -818,6 +1068,130 @@ def _verification_result_data(
         "max_fix_attempts": state.max_fix_attempts,
         "repair_limit_reached": state.repair_limit_reached,
     }
+    if policy_decision is not None:
+        data.update(_command_policy_fields(policy_decision))
+    return data
+
+
+def _verification_not_executed_result(
+    command: VerificationCommand,
+    state: VerificationToolState,
+    *,
+    attempt: int,
+    timeout_ms: int,
+    policy_decision: CommandPolicyDecision,
+    status: str,
+    output: str,
+    backend: str,
+    workspace: str | Path,
+    execution_data: dict[str, object] | None = None,
+) -> ToolResult:
+    result = VerificationResult(
+        command_id=command.id,
+        kind=command.kind,
+        status="error",
+        argv=command.argv,
+        cwd=command.cwd,
+        exit_code=None,
+        duration_ms=0,
+        output=output,
+        truncated=False,
+        omitted_lines=0,
+        omitted_bytes=0,
+        attempt=attempt,
+    )
+    state.record_verification(result)
+    data = _verification_result_data(
+        result,
+        state=state,
+        timeout_ms=timeout_ms,
+        policy_decision=policy_decision,
+        workspace=workspace,
+        backend=backend,
+    )
+    data["status"] = status
+    data["verification_status"] = result.status
+    if execution_data is not None:
+        data.update(execution_data)
+        data["verification_status"] = result.status
+    return ToolResult(ok=False, output=output, data=data)
+
+
+def _docker_verification_result(
+    outcome: SandboxExecutionOutcome,
+    command: VerificationCommand,
+    state: VerificationToolState,
+    *,
+    attempt: int,
+    timeout_ms: int,
+    workspace: str | Path,
+) -> ToolResult:
+    secure_result = outcome.result
+    verification_status = (
+        secure_result.status
+        if secure_result.status in {"passed", "failed", "timed_out"}
+        else "error"
+    )
+    result = VerificationResult(
+        command_id=command.id,
+        kind=command.kind,
+        status=verification_status,  # type: ignore[arg-type]
+        argv=command.argv,
+        cwd=command.cwd,
+        exit_code=secure_result.exit_code,
+        duration_ms=secure_result.duration_ms,
+        output=secure_result.output or secure_result.error_reason or "",
+        truncated=secure_result.output_truncated,
+        omitted_lines=secure_result.omitted_lines,
+        omitted_bytes=secure_result.omitted_bytes,
+        attempt=attempt,
+    )
+    state.record_verification(result)
+    tool_result = _docker_tool_result(outcome)
+    data = dict(tool_result.data or {})
+    data.update(
+        {
+            "command_id": command.id,
+            "kind": command.kind,
+            "attempt": attempt,
+            "verification_status": result.status,
+            "active_failure_command_id": state.unresolved_failure_command_id,
+            "repair_attempts": state.repair_attempts,
+            "max_fix_attempts": state.max_fix_attempts,
+            "repair_limit_reached": state.repair_limit_reached,
+        }
+    )
+    return ToolResult(
+        ok=result.status == "passed",
+        output=result.output or f"Verification {result.status}: {command.id}",
+        data=data,
+    )
+
+
+def _verification_policy_decision_or_none(
+    config: AgentConfig,
+    *,
+    command_id: str,
+    command: VerificationCommand | None,
+    discovery: VerificationDiscoveryResult,
+    timeout_ms: int,
+    max_output_bytes: int,
+    max_output_lines: int,
+) -> CommandPolicyDecision | None:
+    if command is None or not command.available:
+        return None
+    try:
+        return evaluate_verification_command_policy(
+            config.workspace,
+            command_id=command_id,
+            command=command,
+            discovery=discovery,
+            timeout_ms=timeout_ms,
+            max_output_bytes=max_output_bytes,
+            max_output_lines=max_output_lines,
+        )
+    except ValueError:
+        return None
 
 
 def _reject_unknown_arguments(args: dict[str, Any], allowed: set[str]) -> None:
@@ -833,49 +1207,468 @@ def _run_command_tool(
     approval_handler: ApprovalHandler,
     call_id: str,
     arguments_sha256: str,
+    session_id: str | None,
+    security_event_handler: SecurityEventHandler | None,
 ) -> ToolResult:
-    command = _require_string(args.get("command"), "command")
+    if "command" in args:
+        return ToolResult(
+            ok=False,
+            output=(
+                'run_command no longer accepts "command"; provide a non-empty "argv" array.'
+            ),
+        )
+
+    _reject_unknown_arguments(args, {"argv", "cwd", "timeout_ms"})
+    argv = _require_argv(args)
+    cwd = _optional_string_argument(args, "cwd", default=".")
     timeout_ms = _require_positive_int(
         args,
         "timeout_ms",
         default=DEFAULT_COMMAND_TIMEOUT_MS,
         maximum=MAX_COMMAND_TIMEOUT_MS,
     )
+    resolved_cwd, command_spec, policy_decision = _evaluate_execution_policy(
+        config,
+        argv=argv,
+        cwd=cwd,
+        timeout_ms=timeout_ms,
+        source="tool",
+        purpose="Run a model-requested workspace command",
+    )
+    _emit_security_event(
+        security_event_handler,
+        "security.policy_evaluated",
+        {"policy": policy_decision.to_dict()},
+    )
+    if policy_decision.disposition == "deny":
+        return _blocked_command_result(
+            argv,
+            cwd=command_spec.cwd,
+            timeout_ms=timeout_ms,
+            policy_decision=policy_decision,
+        )
+    use_docker = _should_use_docker(config, policy_decision)
+    if policy_decision.disposition == "sandbox_required" and not use_docker:
+        return _blocked_command_result(
+            argv,
+            cwd=command_spec.cwd,
+            timeout_ms=timeout_ms,
+            policy_decision=policy_decision,
+        )
 
-    if config.permission_mode != "workspace-write" and _looks_mutating(command):
+    if config.permission_mode != "workspace-write" and _looks_mutating(argv):
         return ToolResult(
             ok=False,
             output="Command appears to modify files and read-only mode is active. Re-run with --write if this is intended.",
+            data={
+                "type": "secure_command_result",
+                "argv": list(argv),
+                "cwd": command_spec.cwd,
+                "shell": False,
+                "timeout_ms": timeout_ms,
+                "exit_code": None,
+                "timed_out": False,
+                "duration_ms": 0,
+                "status": "permission_denied",
+                "backend": None,
+                "sandboxed": False,
+                "image_digest": None,
+                **_command_policy_fields(policy_decision),
+            },
         )
 
-    request = ApprovalRequest(
-        call_id=call_id,
-        action="run_command",
-        summary=f"Run shell command: {command}",
-        arguments_sha256=arguments_sha256,
-        details={
-            "command": command,
-            "cwd": str(Path(config.workspace).resolve()),
-            "timeout_ms": timeout_ms,
-            "shell": True,
-        },
-    )
-    if not _approval_granted(approval_handler, request):
-        return ToolResult(ok=False, output="User declined command execution.")
+    approval_granted = False
+    if policy_decision.requires_approval:
+        rendered_argv = subprocess.list2cmdline(list(argv))
+        request = ApprovalRequest(
+            call_id=call_id,
+            action="run_command",
+            summary=f"Run command: {rendered_argv}",
+            arguments_sha256=arguments_sha256,
+            details={
+                "argv": argv,
+                "cwd": command_spec.cwd,
+                "timeout_ms": timeout_ms,
+                "shell": False,
+                "backend": "docker" if use_docker else "host",
+                "sandboxed": use_docker,
+                "network_mode": "none" if use_docker else "host",
+                "image_reference": config.sandbox_image if use_docker else None,
+                "image_digest": config.sandbox_image_digest if use_docker else None,
+                **_command_policy_fields(policy_decision),
+            },
+        )
+        if not _approval_granted(approval_handler, request):
+            return ToolResult(
+                ok=False,
+                output="User declined command execution.",
+                data={
+                    "type": "secure_command_result",
+                    "argv": list(argv),
+                    "cwd": command_spec.cwd,
+                    "shell": False,
+                    "timeout_ms": timeout_ms,
+                    "exit_code": None,
+                    "timed_out": False,
+                    "duration_ms": 0,
+                    "status": "approval_declined",
+                    "backend": "docker" if use_docker else "host",
+                    "sandboxed": use_docker,
+                    "image_digest": config.sandbox_image_digest if use_docker else None,
+                    **_command_policy_fields(policy_decision),
+                },
+            )
+        approval_granted = True
 
-    return _run_shell_command(command, config.workspace, timeout_ms)
+    if use_docker:
+        return _run_docker_command(
+            config,
+            command_spec,
+            policy_decision,
+            approval_granted=approval_granted,
+            session_id=session_id,
+            call_id=call_id,
+            security_event_handler=security_event_handler,
+        )
+
+    return _run_argv_command(
+        argv,
+        config.workspace,
+        cwd,
+        timeout_ms,
+        policy_decision=policy_decision,
+        approval_granted=approval_granted,
+        command_spec=command_spec,
+    )
+
+
+def _run_internal_argv_command(
+    argv: tuple[str, ...],
+    config: AgentConfig,
+    *,
+    purpose: str,
+    cwd: str = ".",
+    timeout_ms: int = DEFAULT_COMMAND_TIMEOUT_MS,
+) -> ToolResult:
+    _resolved_cwd, command_spec, policy_decision = _evaluate_execution_policy(
+        config,
+        argv=argv,
+        cwd=cwd,
+        timeout_ms=timeout_ms,
+        source="internal",
+        purpose=purpose,
+    )
+    return _run_argv_command(
+        argv,
+        config.workspace,
+        cwd,
+        timeout_ms,
+        policy_decision=policy_decision,
+        approval_granted=False,
+        command_spec=command_spec,
+    )
 
 
 def _git_diff_tool(config: AgentConfig) -> ToolResult:
-    stat = _run_shell_command("git diff --stat", config.workspace, 30_000)
-    diff = _run_shell_command("git diff", config.workspace, 30_000)
+    stat = _run_internal_argv_command(
+        ("git", "diff", "--stat"),
+        config,
+        purpose="Inspect Git diff statistics",
+    )
+    diff = _run_internal_argv_command(
+        ("git", "diff"),
+        config,
+        purpose="Inspect the current Git diff",
+    )
+    command_results = [
+        result.data
+        for result in (stat, diff)
+        if result.data is not None
+    ]
     return ToolResult(
         ok=stat.ok and diff.ok,
         output="\n".join(["[git diff --stat]", stat.output, "", "[git diff]", diff.output]),
+        data={
+            "type": "command_batch_result",
+            "commands": command_results,
+        },
     )
 
 
-def _looks_mutating(command: str) -> bool:
+def _evaluate_execution_policy(
+    config: AgentConfig,
+    *,
+    argv: tuple[str, ...],
+    cwd: str,
+    timeout_ms: int,
+    source: str,
+    purpose: str,
+) -> tuple[Path, CommandSpec, CommandPolicyDecision]:
+    resolved_cwd = _resolve_command_cwd(config.workspace, cwd)
+    root = Path(config.workspace).resolve(strict=True)
+    relative_cwd = resolved_cwd.relative_to(root).as_posix()
+    command = CommandSpec(
+        argv=argv,
+        cwd=relative_cwd,
+        source=source,  # type: ignore[arg-type]
+        purpose=purpose,
+        limits=ExecutionLimits(timeout_ms=timeout_ms),
+    )
+    return resolved_cwd, command, evaluate_command_policy(command)
+
+
+def _command_policy_fields(
+    decision: CommandPolicyDecision,
+) -> dict[str, object]:
+    return {
+        "policy_version": decision.policy_version,
+        "rule_id": decision.rule_id,
+        "disposition": decision.disposition,
+        "reasons": list(decision.reasons),
+        "normalized_executable": decision.normalized_executable,
+        "requires_approval": decision.requires_approval,
+        "requires_sandbox": decision.requires_sandbox,
+        "policy": decision.to_dict(),
+    }
+
+
+def _blocked_command_result(
+    argv: tuple[str, ...],
+    *,
+    cwd: str,
+    timeout_ms: int,
+    policy_decision: CommandPolicyDecision,
+) -> ToolResult:
+    status = (
+        "denied"
+        if policy_decision.disposition == "deny"
+        else "sandbox_unavailable"
+    )
+    output = (
+        "Docker sandbox routing is required and host fallback is disabled."
+        if policy_decision.disposition == "approval_required"
+        else format_command_policy_block(policy_decision)
+    )
+    return ToolResult(
+        ok=False,
+        output=output,
+        data={
+            "type": "secure_command_result",
+            "argv": list(argv),
+            "cwd": cwd,
+            "shell": False,
+            "timeout_ms": timeout_ms,
+            "exit_code": None,
+            "timed_out": False,
+            "duration_ms": 0,
+            "status": status,
+            "backend": None,
+            "sandboxed": False,
+            "image_digest": None,
+            **_command_policy_fields(policy_decision),
+        },
+    )
+
+
+def _should_use_docker(
+    config: AgentConfig,
+    decision: CommandPolicyDecision,
+) -> bool:
+    if decision.disposition == "deny":
+        return False
+    if config.sandbox_mode == "docker":
+        return True
+    return config.sandbox_mode == "auto" and decision.requires_sandbox
+
+
+def _run_docker_command(
+    config: AgentConfig,
+    command: CommandSpec,
+    decision: CommandPolicyDecision,
+    *,
+    approval_granted: bool,
+    session_id: str | None,
+    call_id: str,
+    security_event_handler: SecurityEventHandler | None,
+) -> ToolResult:
+    execution = _execute_docker_command(
+        config,
+        command,
+        decision,
+        approval_granted=approval_granted,
+        session_id=session_id,
+        call_id=call_id,
+        security_event_handler=security_event_handler,
+    )
+    if isinstance(execution, ToolResult):
+        return execution
+    return _docker_tool_result(execution)
+
+
+def _execute_docker_command(
+    config: AgentConfig,
+    command: CommandSpec,
+    decision: CommandPolicyDecision,
+    *,
+    approval_granted: bool,
+    session_id: str | None,
+    call_id: str,
+    security_event_handler: SecurityEventHandler | None = None,
+) -> SandboxExecutionOutcome | ToolResult:
+    backend = DockerSandboxBackend(image_reference=config.sandbox_image)
+    if config.sandbox_image_digest is None:
+        capability = backend.probe_capability(config.workspace)
+    else:
+        capability = SandboxCapability(
+            backend="docker",
+            available=True,
+            reason=None,
+            image_reference=config.sandbox_image,
+            image_digest=config.sandbox_image_digest,
+        )
+    if not capability.available or capability.image_digest is None:
+        _emit_security_event(
+            security_event_handler,
+            "sandbox.capability_checked",
+            {"capability": capability.to_dict()},
+        )
+        return _docker_unavailable_result(
+            command,
+            decision,
+            capability.reason or "Docker sandbox capability is unavailable.",
+        )
+
+    plan = SandboxExecutionPlan(
+        command=command,
+        decision=decision,
+        capability=capability,
+        backend="docker",
+        sandboxed=True,
+        network_mode="none",
+        image_digest=capability.image_digest,
+    )
+    outcome = backend.execute(
+        config.workspace,
+        plan,
+        session_id=_sandbox_identifier("session", session_id or config.workspace),
+        call_id=_sandbox_identifier("call", call_id),
+        approval_granted=approval_granted,
+        event_handler=security_event_handler,
+    )
+    if outcome.backend_argv:
+        persisted_result = outcome.result.to_dict()
+        persisted_result["output"] = ""
+        _emit_security_event(
+            security_event_handler,
+            "sandbox.finished",
+            {"result": persisted_result},
+        )
+    for cleanup_kind, succeeded, error in (
+        (
+            "container",
+            outcome.container_cleanup_succeeded,
+            outcome.container_cleanup_error,
+        ),
+        (
+            "snapshot",
+            outcome.snapshot_cleanup_succeeded,
+            outcome.snapshot_cleanup_error,
+        ),
+    ):
+        if succeeded is False:
+            _emit_security_event(
+                security_event_handler,
+                "sandbox.cleanup_failed",
+                {
+                    "cleanup_kind": cleanup_kind,
+                    "reason": error or f"{cleanup_kind} cleanup failed",
+                },
+            )
+    return outcome
+
+
+def _docker_unavailable_result(
+    command: CommandSpec,
+    decision: CommandPolicyDecision,
+    reason: str,
+) -> ToolResult:
+    return ToolResult(
+        ok=False,
+        output=reason,
+        data={
+            "type": "secure_command_result",
+            "argv": list(command.argv),
+            "cwd": command.cwd,
+            "shell": False,
+            "timeout_ms": command.limits.timeout_ms,
+            "backend": "docker",
+            "sandboxed": False,
+            "image_digest": None,
+            "exit_code": None,
+            "timed_out": False,
+            "duration_ms": 0,
+            "output_truncated": False,
+            "status": "sandbox_unavailable",
+            "error_reason": reason,
+            **_command_policy_fields(decision),
+        },
+    )
+
+
+def _docker_tool_result(outcome: SandboxExecutionOutcome) -> ToolResult:
+    result = outcome.result
+    output = result.output or result.error_reason or f"Command {result.status}."
+    return ToolResult(
+        ok=result.status == "passed",
+        output=output,
+        data={
+            "type": "secure_command_result",
+            "argv": list(result.command.argv),
+            "cwd": result.command.cwd,
+            "shell": False,
+            "timeout_ms": result.command.limits.timeout_ms,
+            "backend": result.backend,
+            "sandboxed": result.sandboxed,
+            "image_digest": result.image_digest,
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "duration_ms": result.duration_ms,
+            "output_truncated": result.output_truncated,
+            "omitted_lines": result.omitted_lines,
+            "omitted_bytes": result.omitted_bytes,
+            "status": result.status,
+            "error_reason": result.error_reason,
+            "network_mode": "none",
+            "snapshot": (
+                dict(outcome.snapshot_summary)
+                if outcome.snapshot_summary is not None
+                else None
+            ),
+            "snapshot_cleanup_succeeded": outcome.snapshot_cleanup_succeeded,
+            "snapshot_cleanup_error": outcome.snapshot_cleanup_error,
+            "container_cleanup_attempted": outcome.container_cleanup_attempted,
+            "container_cleanup_succeeded": outcome.container_cleanup_succeeded,
+            "container_cleanup_error": outcome.container_cleanup_error,
+            **_command_policy_fields(result.decision),
+        },
+    )
+
+
+def _sandbox_identifier(prefix: str, value: str) -> str:
+    return f"{prefix}-{hashlib.sha256(value.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _emit_security_event(
+    handler: SecurityEventHandler | None,
+    event_type: str,
+    payload: Mapping[str, object],
+) -> None:
+    if handler is not None:
+        handler(event_type, payload)
+
+
+def _looks_mutating(argv: tuple[str, ...]) -> bool:
+    command = " ".join(argv)
     mutating_patterns = [
         r"\bnpm\s+(install|i|update|uninstall|remove|audit\s+fix)\b",
         r"\bpnpm\s+(add|install|update|remove)\b",
@@ -884,67 +1677,118 @@ def _looks_mutating(command: str) -> bool:
         r"\bdel\b",
         r"\bRemove-Item\b",
         r"\bgit\s+(checkout|reset|clean|apply|am|merge|rebase|commit)\b",
-        r">",
     ]
     return any(re.search(pattern, command, flags=re.IGNORECASE) for pattern in mutating_patterns)
 
 
-def _run_shell_command(command: str, cwd: str, timeout_ms: int) -> ToolResult:
-    resolved_cwd = str(Path(cwd).resolve())
-    started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=resolved_cwd,
-            shell=True,
-            text=True,
-            capture_output=True,
-            timeout=timeout_ms / 1000,
+def _resolve_command_cwd(workspace: str | Path, cwd: str) -> Path:
+    root = Path(workspace).resolve(strict=True)
+    return resolve_workspace_path(
+        root,
+        cwd,
+        operation="execute",
+        allow_missing=False,
+    )
+
+
+def _run_argv_command(
+    argv: tuple[str, ...],
+    workspace: str | Path,
+    cwd: str,
+    timeout_ms: int,
+    *,
+    policy_decision: CommandPolicyDecision,
+    approval_granted: bool,
+    command_spec: CommandSpec,
+) -> ToolResult:
+    resolved_cwd = _resolve_command_cwd(workspace, cwd)
+    if policy_decision.disposition in {"deny", "sandbox_required"}:
+        return _blocked_command_result(
+            argv,
+            cwd=command_spec.cwd,
+            timeout_ms=timeout_ms,
+            policy_decision=policy_decision,
         )
-    except subprocess.TimeoutExpired as exc:
-        duration_ms = max(0, round((time.monotonic() - started) * 1000))
-        stdout = _coerce_process_output(exc.stdout)
-        stderr = _coerce_process_output(exc.stderr)
-        return ToolResult(
-            ok=False,
-            output=(
-                f"Command timed out after {timeout_ms}ms.\n{stdout}\n{stderr}"
-            ).strip(),
-            data={
-                "type": "command_result",
-                "command": command,
-                "cwd": resolved_cwd,
-                "shell": True,
-                "timeout_ms": timeout_ms,
-                "exit_code": None,
-                "timed_out": True,
-                "duration_ms": duration_ms,
-            },
+    if policy_decision.disposition not in {"allow_host", "approval_required"}:
+        raise ValueError(
+            f"Unsupported host execution disposition: {policy_decision.disposition}"
         )
 
-    duration_ms = max(0, round((time.monotonic() - started) * 1000))
-    return ToolResult(
-        ok=completed.returncode == 0,
-        output="\n".join(
+    workspace_root = Path(workspace).resolve(strict=True)
+    relative_cwd = resolved_cwd.relative_to(workspace_root).as_posix()
+    if (
+        command_spec.argv != argv
+        or command_spec.cwd != relative_cwd
+        or command_spec.limits.timeout_ms != timeout_ms
+    ):
+        raise ValueError(
+            "Authorized command specification changed before process execution."
+        )
+    process_result = run_host_process(
+        workspace_root,
+        command_spec,
+        policy_decision,
+        approval_granted=approval_granted,
+    )
+    metadata = _host_process_fields(process_result)
+
+    if process_result.status == "timed_out":
+        output = "\n".join(
             part
             for part in [
-                f"exit code: {completed.returncode}",
-                completed.stdout.strip(),
-                completed.stderr.strip(),
+                f"Command timed out after {timeout_ms}ms.",
+                process_result.stdout.strip(),
+                process_result.stderr.strip(),
             ]
             if part
-        ),
+        )
+    elif process_result.status in {"not_found", "error"}:
+        output = process_result.error_reason or "Failed to execute command."
+    else:
+        output = "\n".join(
+            part
+            for part in [
+                f"exit code: {process_result.exit_code}",
+                process_result.stdout.strip(),
+                process_result.stderr.strip(),
+            ]
+            if part
+        )
+
+    return ToolResult(
+        ok=process_result.status == "passed",
+        output=output,
         data={
-            "type": "command_result",
-            "command": command,
-            "cwd": resolved_cwd,
-            "shell": True,
+            "type": "secure_command_result",
+            "argv": list(argv),
+            "cwd": command_spec.cwd,
+            "shell": False,
             "timeout_ms": timeout_ms,
-            "exit_code": completed.returncode,
-            "timed_out": False,
-            "duration_ms": duration_ms,
+            "exit_code": process_result.exit_code,
+            "timed_out": process_result.timed_out,
+            "duration_ms": process_result.duration_ms,
+            "status": process_result.status,
+            "backend": "host",
+            "sandboxed": False,
+            "image_digest": None,
+            "network_mode": "host",
+            **metadata,
+            **_command_policy_fields(policy_decision),
         },
     )
+
+
+def _host_process_fields(process_result: HostProcessResult) -> dict[str, object]:
+    return {
+        "actual_executable": process_result.actual_executable,
+        "allowed_environment_keys": list(process_result.allowed_environment_keys),
+        "output_truncated": process_result.output_truncated,
+        "omitted_lines": process_result.omitted_lines,
+        "omitted_bytes": process_result.omitted_bytes,
+        "process_tree_terminated": process_result.process_tree_terminated,
+        "cleanup_error": process_result.cleanup_error,
+        "error_reason": process_result.error_reason,
+    }
 
 
 def _approval_granted(
@@ -954,6 +1798,23 @@ def _approval_granted(
     decision = handler(request)
     validate_approval_decision(request, decision)
     return decision.outcome == "approved"
+
+
+def _hash_patch_plan_files(plan: PatchPlan) -> dict[str, str | None]:
+    return {
+        file.path: _hash_patch_file(plan, file)
+        for file in plan.files
+    }
+
+
+def _hash_patch_file(plan: PatchPlan, file: FilePatchPlan) -> str | None:
+    path = resolve_workspace_path(
+        plan.workspace,
+        file.path,
+        operation="write",
+        allow_missing=True,
+    )
+    return _hash_file_or_none(path)
 
 
 def _hash_file_or_none(path: Path) -> str | None:
@@ -1023,6 +1884,22 @@ def _require_string_list(
     if maximum_items is not None and len(value) > maximum_items:
         raise ValueError(f"{name} must contain at most {maximum_items} items.")
     return value
+
+
+def _require_argv(args: dict[str, Any]) -> tuple[str, ...]:
+    values = _require_string_list(
+        args,
+        "argv",
+        required=True,
+        allow_empty=False,
+        maximum_items=MAX_COMMAND_ARGUMENTS,
+    )
+    assert values is not None
+    for index, value in enumerate(values):
+        if "\x00" in value:
+            raise ValueError(f"argv[{index}] must not contain NUL characters.")
+    return tuple(values)
+
 
 
 def _optional_string_argument(

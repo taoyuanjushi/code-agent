@@ -353,3 +353,34 @@ def test_initial_context_has_fixed_sample_and_total_byte_budgets(
     ) <= M2_MAX_INITIAL_CONTENT_BYTES
     assert "src/refund_service.py" in {file.path for file in snapshot.files}
     assert "src/refund_service.py" not in {sample.path for sample in snapshot.samples}
+
+
+def test_workspace_snapshot_excludes_symlink_files_and_directories(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "local.txt").write_text("local\n", encoding="utf-8")
+    target = tmp_path / "target.txt"
+    target.write_text("target\n", encoding="utf-8")
+    internal_link = tmp_path / "internal-link.txt"
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret\n", encoding="utf-8")
+    external_directory = tmp_path / "external-directory"
+    try:
+        internal_link.symlink_to(target)
+        external_directory.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable on this platform: {exc}")
+
+    snapshot = collect_workspace_snapshot(
+        str(tmp_path),
+        task="inspect local.txt",
+        max_inventory_files=20,
+        max_sample_files=6,
+        max_bytes_per_file=1_000,
+        max_total_sample_bytes=4_000,
+    )
+
+    assert [file.path for file in snapshot.files] == ["local.txt", "target.txt"]
+    assert all("link" not in file.path for file in snapshot.files)
+    assert all("external-directory" not in file.path for file in snapshot.files)

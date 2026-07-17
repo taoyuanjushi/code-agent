@@ -221,19 +221,52 @@ def render_approval_request(request: ApprovalRequest) -> str:
         rendered = subprocess.list2cmdline(list(argv))
         return (
             f"Run verification in {cwd}?\n{rendered}\n"
-            f"timeout_ms: {timeout_ms}"
+            f"timeout_ms: {timeout_ms}\n"
+            f"{_render_execution_security(details)}"
         )
 
     if request.action == "run_command":
-        command = _detail_string(details, "command")
+        argv = _detail_string_tuple(details, "argv")
         cwd = _detail_string(details, "cwd")
         timeout_ms = details.get("timeout_ms")
+        rendered = subprocess.list2cmdline(list(argv))
         return (
-            f"Run command in {cwd}?\n{command}\n"
-            f"timeout_ms: {timeout_ms}"
+            f"Run command in {cwd}?\n{rendered}\n"
+            f"timeout_ms: {timeout_ms}\n"
+            f"{_render_execution_security(details)}"
         )
 
     return f"Approve {request.action}?\n{request.summary}"
+
+
+def _render_execution_security(
+    details: Mapping[str, ApprovalDetail],
+) -> str:
+    backend = details.get("backend", "host")
+    sandboxed = details.get("sandboxed", False)
+    network_mode = details.get("network_mode", "host")
+    rule_id = details.get("rule_id", "unavailable")
+    reasons = details.get("reasons", ())
+    if isinstance(reasons, tuple):
+        rendered_reasons = "; ".join(
+            reason for reason in reasons if isinstance(reason, str)
+        ) or "none"
+    else:
+        rendered_reasons = "unavailable"
+    image_reference = details.get("image_reference")
+    image_digest = details.get("image_digest")
+    lines = [
+        f"backend: {backend}",
+        f"sandboxed: {str(sandboxed).lower()}",
+        f"network_mode: {network_mode}",
+        f"policy_rule: {rule_id}",
+        f"policy_reasons: {rendered_reasons}",
+    ]
+    if image_reference is not None:
+        lines.append(f"image: {image_reference}")
+    if image_digest is not None:
+        lines.append(f"image_digest: {image_digest}")
+    return "\n".join(lines)
 
 
 def _detail_string(

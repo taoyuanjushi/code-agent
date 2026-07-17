@@ -7,7 +7,12 @@ from .instructions import (
     format_agent_instructions,
     instructions_for_path,
 )
-from .path_safety import resolve_inside_workspace
+from .path_safety import resolve_workspace_path
+from .security.path_policy import (
+    SENSITIVE_PATH_DENIAL_REASON,
+    SensitivePathPolicy,
+    load_sensitive_path_policy,
+)
 from .types import FileReadResult
 
 DEFAULT_MAX_FILES = 20
@@ -29,13 +34,19 @@ def read_many_files(
 
     root = Path(workspace).resolve()
     ignore_policy = load_ignore_policy(root)
+    sensitive_policy = load_sensitive_path_policy(root)
     repository_instructions = discover_agent_instructions(root)
     remaining_bytes = max_total_bytes
     results: list[FileReadResult] = []
 
     for index, requested_path in enumerate(paths):
         try:
-            full_path = resolve_inside_workspace(root, requested_path)
+            full_path = resolve_workspace_path(
+                root,
+                requested_path,
+                operation="read",
+                allow_missing=True,
+            )
             normalized_path = full_path.relative_to(root).as_posix()
         except (OSError, ValueError) as exc:
             results.append(_failed_result(requested_path, str(exc)))
@@ -67,10 +78,13 @@ def read_many_files(
             continue
 
         result = _read_one_file(
+            root=root,
+            requested_path=requested_path,
             full_path=full_path,
             normalized_path=normalized_path,
             instruction_paths=instruction_paths,
             ignore_policy=ignore_policy,
+            sensitive_policy=sensitive_policy,
             max_bytes=min(max_bytes_per_file, remaining_bytes),
         )
         results.append(result)
@@ -131,13 +145,35 @@ def format_file_read_results(
 
 def _read_one_file(
     *,
+    root: Path,
+    requested_path: str,
     full_path: Path,
     normalized_path: str,
     instruction_paths: tuple[str, ...],
     ignore_policy: IgnorePolicy,
+    sensitive_policy: SensitivePathPolicy,
     max_bytes: int,
 ) -> FileReadResult:
     try:
+        full_path = resolve_workspace_path(
+            root,
+            requested_path,
+            operation="read",
+            allow_missing=False,
+        )
+        sensitive_decision = sensitive_policy.evaluate(
+            full_path,
+            operation="read",
+        )
+        if not sensitive_decision.allowed:
+            return _failed_result(
+                normalized_path,
+                (
+                    f"{SENSITIVE_PATH_DENIAL_REASON}: "
+                    "Access to sensitive workspace paths is denied."
+                ),
+                instruction_paths,
+            )
         if not full_path.exists():
             return _failed_result(
                 normalized_path,
@@ -180,7 +216,7 @@ def _read_one_file(
             error=None,
             instruction_paths=instruction_paths,
         )
-    except (OSError, UnicodeError) as exc:
+    except (OSError, UnicodeError, ValueError) as exc:
         return _failed_result(normalized_path, str(exc), instruction_paths)
 
 

@@ -454,3 +454,18 @@ def test_store_directories_remain_under_workspace(tmp_path: Path) -> None:
             store.locks_dir,
         )
     )
+
+
+def test_session_store_rejects_symlinked_internal_state_directory(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-session-outside"
+    outside.mkdir()
+    state_directory = tmp_path / ".coding-agent"
+    try:
+        state_directory.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable on this platform: {exc}")
+
+    with pytest.raises(ValueError, match="symlink or reparse"):
+        SessionStore(tmp_path)

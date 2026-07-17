@@ -6,6 +6,10 @@ from collections.abc import Mapping, Sequence
 from typing import cast
 
 from ..approvals import APPROVAL_OUTCOMES, validate_approval_decision
+from ..security.path_policy import (
+    SENSITIVE_PATH_DENIAL_REASON,
+    load_sensitive_path_policy,
+)
 from .codec import (
     approval_decision_from_dict,
     approval_request_from_dict,
@@ -51,7 +55,7 @@ def build_session_replay_payload(
     approvals = rebuild_approval_projection(events)
     approvals_by_call_id = _approvals_by_call_id(approvals)
     tool_names = _tool_names_by_call_id(events)
-    artifact_cache: dict[str, dict[str, object]] = {}
+    artifact_cache: dict[tuple[str, str, str], dict[str, object]] = {}
     timeline = [
         _timeline_item(
             event,
@@ -191,7 +195,7 @@ def _timeline_item(
     tool_names: Mapping[str, str],
     store: SessionStore,
     verbose: bool,
-    artifact_cache: dict[str, dict[str, object]],
+    artifact_cache: dict[tuple[str, str, str], dict[str, object]],
 ) -> dict[str, object]:
     summary, details = _event_summary(
         event,
@@ -299,6 +303,45 @@ def _event_summary(
         if attempt is not None:
             summary += f" (attempt {attempt})"
         return summary, _details(command_id=command_id, status=status, attempt=attempt)
+    if event.type == "security.policy_evaluated":
+        policy = _optional_mapping(payload.get("policy")) or {}
+        rule_id = _string_value(policy.get("rule_id")) or "unknown"
+        disposition = _string_value(policy.get("disposition")) or "unknown"
+        return (
+            f"policy {rule_id} -> {disposition}",
+            _details(rule_id=rule_id, disposition=disposition),
+        )
+    if event.type == "sandbox.capability_checked":
+        capability = _optional_mapping(payload.get("capability")) or {}
+        available = capability.get("available")
+        digest = _string_value(capability.get("image_digest"))
+        status = "available" if available is True else "unavailable"
+        return (
+            f"sandbox capability -> {status}",
+            _details(status=status, image_digest=digest),
+        )
+    if event.type == "sandbox.snapshot_created":
+        snapshot = _optional_mapping(payload.get("snapshot")) or {}
+        files = _int_value(snapshot.get("file_count"))
+        total_bytes = _int_value(snapshot.get("total_bytes"))
+        return (
+            f"sandbox snapshot created ({files or 0} files)",
+            _details(file_count=files, total_bytes=total_bytes),
+        )
+    if event.type == "sandbox.started":
+        container = _string_value(payload.get("container_name"))
+        return "sandbox started", _details(container_name=container)
+    if event.type == "sandbox.finished":
+        result = _optional_mapping(payload.get("result")) or {}
+        status = _string_value(result.get("status")) or "unknown"
+        return f"sandbox finished -> {status}", _details(status=status)
+    if event.type == "sandbox.cleanup_failed":
+        kind = _string_value(payload.get("cleanup_kind")) or "unknown"
+        reason = _string_value(payload.get("reason"))
+        return (
+            f"sandbox {kind} cleanup failed",
+            _details(cleanup_kind=kind, reason=reason),
+        )
     if event.type == "checkpoint.saved":
         return "checkpoint saved", {}
     return event.type, {}
@@ -434,7 +477,7 @@ def _expand_artifacts(
     *,
     store: SessionStore,
     session_id: str,
-    cache: dict[str, dict[str, object]],
+    cache: dict[tuple[str, str, str], dict[str, object]],
 ) -> object:
     if isinstance(value, Mapping):
         direct_ref = _artifact_ref(value)
@@ -446,6 +489,7 @@ def _expand_artifacts(
                     session_id,
                     direct_ref,
                     cache,
+                    source_path=None,
                 ),
             }
         result = {
@@ -465,6 +509,7 @@ def _expand_artifacts(
                 session_id,
                 nested_ref,
                 cache,
+                source_path=_artifact_source_path(value),
             )
         return result
     if isinstance(value, tuple):
@@ -484,11 +529,57 @@ def _artifact_content(
     store: SessionStore,
     session_id: str,
     ref: ArtifactRef,
-    cache: dict[str, dict[str, object]],
+    cache: dict[tuple[str, str, str], dict[str, object]],
+    *,
+    source_path: str | None,
 ) -> dict[str, object]:
-    cached = cache.get(ref.sha256)
+    cache_key = (ref.sha256, ref.path, source_path or "")
+    cached = cache.get(cache_key)
     if cached is not None:
         return dict(cached)
+
+    if source_path is not None:
+        try:
+            source_decision = load_sensitive_path_policy(store.workspace).evaluate(
+                source_path,
+                operation="artifact_expand",
+            )
+        except (TypeError, ValueError):
+            source_decision = None
+        if source_decision is None or not source_decision.allowed:
+            result = {
+                "available": False,
+                "reason": SENSITIVE_PATH_DENIAL_REASON,
+                "media_type": ref.media_type,
+                "encoding": ref.encoding,
+            }
+            cache[cache_key] = result
+            return dict(result)
+
+    if not store.artifacts_dir.is_dir():
+        result = {
+            "available": False,
+            "reason": "artifact_missing",
+            "media_type": ref.media_type,
+            "encoding": ref.encoding,
+        }
+        cache[cache_key] = result
+        return dict(result)
+
+    artifact_decision = load_sensitive_path_policy(store.artifacts_dir).evaluate(
+        ref.path,
+        operation="artifact_expand",
+    )
+    if not artifact_decision.allowed:
+        result = {
+            "available": False,
+            "reason": SENSITIVE_PATH_DENIAL_REASON,
+            "media_type": ref.media_type,
+            "encoding": ref.encoding,
+        }
+        cache[cache_key] = result
+        return dict(result)
+
     try:
         content = store.get_artifact(session_id, ref)
     except ArtifactNotFoundError:
@@ -498,7 +589,7 @@ def _artifact_content(
             "media_type": ref.media_type,
             "encoding": ref.encoding,
         }
-        cache[ref.sha256] = result
+        cache[cache_key] = result
         return dict(result)
 
     result = {
@@ -517,8 +608,13 @@ def _artifact_content(
             result["text"] = text
     else:
         result["base64"] = base64.b64encode(content).decode("ascii")
-    cache[ref.sha256] = result
+    cache[cache_key] = result
     return dict(result)
+
+
+def _artifact_source_path(value: Mapping[object, object]) -> str | None:
+    source_path = value.get("source_path")
+    return source_path if isinstance(source_path, str) else None
 
 
 def _artifact_ref(value: object) -> ArtifactRef | None:

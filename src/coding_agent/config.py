@@ -7,9 +7,11 @@ from .types import (
     AgentConfig,
     PermissionMode,
     ReasoningEffort,
+    SandboxMode,
 )
 
 VALID_REASONING_EFFORTS: set[str] = {"none", "low", "medium", "high", "xhigh"}
+VALID_SANDBOX_MODES: set[str] = {"none", "auto", "docker"}
 
 
 def load_config(options: Namespace) -> AgentConfig:
@@ -19,7 +21,17 @@ def load_config(options: Namespace) -> AgentConfig:
         or os.getenv("CODING_AGENT_REASONING_EFFORT")
         or "medium"
     )
-    permission_mode: PermissionMode = "workspace-write" if getattr(options, "write", False) else "read-only"
+    full_auto = bool(getattr(options, "full_auto", False))
+    permission_mode: PermissionMode = (
+        "workspace-write"
+        if getattr(options, "write", False) or full_auto
+        else "read-only"
+    )
+    sandbox_mode = _parse_sandbox_mode(
+        getattr(options, "sandbox", None)
+        or os.getenv("CODING_AGENT_SANDBOX")
+        or "auto"
+    )
 
     return AgentConfig(
         workspace=workspace,
@@ -27,8 +39,12 @@ def load_config(options: Namespace) -> AgentConfig:
         reasoning_effort=reasoning_effort,
         max_turns=_parse_positive_int(getattr(options, "max_turns", None), 8, "max turns"),
         permission_mode=permission_mode,
-        auto_approve_commands=bool(getattr(options, "auto_approve_commands", False)),
-        auto_approve_edits=bool(getattr(options, "auto_approve_edits", False)),
+        auto_approve_commands=(
+            bool(getattr(options, "auto_approve_commands", False)) or full_auto
+        ),
+        auto_approve_edits=(
+            bool(getattr(options, "auto_approve_edits", False)) or full_auto
+        ),
         context_max_files=_parse_positive_int(
             getattr(options, "context_max_files", None),
             6,
@@ -46,6 +62,13 @@ def load_config(options: Namespace) -> AgentConfig:
             "max fix attempts",
             maximum=MAX_FIX_ATTEMPTS,
         ),
+        sandbox_mode=sandbox_mode,
+        sandbox_image=(
+            getattr(options, "sandbox_image", None)
+            or os.getenv("CODING_AGENT_SANDBOX_IMAGE")
+            or "python:3.12-slim"
+        ),
+        full_auto=full_auto,
     )
 
 
@@ -81,4 +104,10 @@ def _parse_reasoning_effort(value: str) -> ReasoningEffort:
     if value not in VALID_REASONING_EFFORTS:
         raise ValueError(f"Invalid reasoning effort: {value}")
 
+    return value  # type: ignore[return-value]
+
+
+def _parse_sandbox_mode(value: str) -> SandboxMode:
+    if value not in VALID_SANDBOX_MODES:
+        raise ValueError(f"Invalid sandbox mode: {value}")
     return value  # type: ignore[return-value]

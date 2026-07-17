@@ -27,6 +27,18 @@ def _write_pyproject(workspace: Path, content: str) -> None:
     (workspace / "pyproject.toml").write_text(content, encoding="utf-8")
 
 
+def _create_symlink_or_skip(
+    link: Path,
+    target: Path,
+    *,
+    is_directory: bool = False,
+) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=is_directory)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+
 def test_discovers_fixture_commands_in_stable_kind_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -60,6 +72,34 @@ def test_discovers_fixture_commands_in_stable_kind_order(
     ]
     assert all(command.available for command in result.commands)
     assert result.workspace == str(FIXTURE.resolve())
+    assert result.errors == ()
+
+
+def test_discovery_ignores_external_python_metadata_and_test_directory_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-python"
+    outside.mkdir()
+    (outside / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\ntestpaths = ['tests']\n",
+        encoding="utf-8",
+    )
+    (outside / "tests").mkdir()
+    _create_symlink_or_skip(
+        tmp_path / "pyproject.toml",
+        outside / "pyproject.toml",
+    )
+    _create_symlink_or_skip(
+        tmp_path / "tests",
+        outside / "tests",
+        is_directory=True,
+    )
+    _set_available_modules(monkeypatch, "pytest")
+
+    result = discover_python_verification_commands(tmp_path)
+
+    assert result.commands == ()
     assert result.errors == ()
 
 

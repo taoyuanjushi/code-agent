@@ -33,3 +33,7 @@ def test_load_config_uses_m2_initial_context_defaults() -> None:
     assert config.context_max_files == 6
     assert config.context_max_bytes_per_file == 8_000
     assert config.max_fix_attempts == 3
+    assert config.sandbox_mode == "auto"
+    assert config.sandbox_image == "python:3.12-slim"
+    assert config.sandbox_image_digest is None
+    assert config.full_auto is False

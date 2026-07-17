@@ -1,8 +1,11 @@
-﻿from dataclasses import dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from .path_safety import ensure_parent_directory, resolve_inside_workspace
+from .path_safety import (
+    ensure_workspace_parent_directory,
+    resolve_workspace_path,
+)
 
 PatchChangeType = Literal["add", "modify", "delete"]
 
@@ -40,6 +43,7 @@ class FilePatchPlan:
 
 @dataclass(frozen=True)
 class PatchPlan:
+    workspace: Path
     files: list[FilePatchPlan]
 
 
@@ -51,19 +55,40 @@ class SplitContent:
 
 
 def plan_patch(workspace: str | Path, patch: str) -> PatchPlan:
+    workspace_path = Path(workspace).resolve(strict=True)
     parsed_files = parse_unified_diff(patch)
-    files = [_plan_file_patch(workspace, parsed_file) for parsed_file in parsed_files]
-    return PatchPlan(files=files)
+    files = [
+        _plan_file_patch(workspace_path, parsed_file)
+        for parsed_file in parsed_files
+    ]
+    return PatchPlan(workspace=workspace_path, files=files)
 
 
 def apply_patch_plan(plan: PatchPlan) -> None:
     for file in plan.files:
+        target = resolve_workspace_path(
+            plan.workspace,
+            file.path,
+            operation="write",
+            allow_missing=file.change_type == "add",
+        )
+        if target != file.absolute_path:
+            raise RuntimeError(
+                f"Patch target changed after planning: {file.path}"
+            )
+
         if file.after_content is None:
-            file.absolute_path.unlink()
+            target.unlink()
             continue
 
-        ensure_parent_directory(file.absolute_path)
-        file.absolute_path.write_text(file.after_content, encoding="utf-8", newline="")
+        target = ensure_workspace_parent_directory(plan.workspace, file.path)
+        target = resolve_workspace_path(
+            plan.workspace,
+            file.path,
+            operation="write",
+            allow_missing=file.change_type == "add",
+        )
+        target.write_text(file.after_content, encoding="utf-8", newline="")
 
 
 def summarize_patch_plan(plan: PatchPlan) -> str:
@@ -164,7 +189,12 @@ def _plan_file_patch(workspace: str | Path, patch_file: ParsedPatchFile) -> File
     if relative_path is None:
         raise ValueError("Invalid patch: both old and new paths are /dev/null.")
 
-    absolute_path = resolve_inside_workspace(workspace, relative_path)
+    absolute_path = resolve_workspace_path(
+        workspace,
+        relative_path,
+        operation="write",
+        allow_missing=True,
+    )
     change_type = _get_change_type(patch_file)
     before_content = _read_existing_content(absolute_path)
 

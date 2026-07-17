@@ -42,6 +42,12 @@ SessionEventType = Literal[
     "tool.recovered",
     "approval.decided",
     "verification.recorded",
+    "security.policy_evaluated",
+    "sandbox.capability_checked",
+    "sandbox.snapshot_created",
+    "sandbox.started",
+    "sandbox.finished",
+    "sandbox.cleanup_failed",
     "checkpoint.saved",
 ]
 
@@ -71,6 +77,11 @@ SESSION_CONFIG_FIELDS = frozenset(
         "context_max_files",
         "context_max_bytes_per_file",
         "max_fix_attempts",
+        "sandbox_mode",
+        "sandbox_image",
+        "sandbox_image_digest",
+        "full_auto",
+        "security_policy_version",
     }
 )
 SESSION_EVENT_TYPES = frozenset(
@@ -88,6 +99,12 @@ SESSION_EVENT_TYPES = frozenset(
         "tool.recovered",
         "approval.decided",
         "verification.recorded",
+        "security.policy_evaluated",
+        "sandbox.capability_checked",
+        "sandbox.snapshot_created",
+        "sandbox.started",
+        "sandbox.finished",
+        "sandbox.cleanup_failed",
         "checkpoint.saved",
     }
 )

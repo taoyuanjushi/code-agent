@@ -1,6 +1,6 @@
 [project]
 name = "coding-agent"
-version = "0.3.0"
+version = "0.4.0"
 description = "A local AI coding agent CLI inspired by Codex, implemented primarily in Python."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -35,5 +35,6 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
   "local_rg: optional smoke test that uses the locally installed ripgrep binary",
-  "local_node: optional smoke test that uses the locally installed Node.js runtime"
+  "local_node: optional smoke test that uses the locally installed Node.js runtime",
+  "docker: opt-in smoke test that uses the local Docker daemon and a preloaded image"
 ]

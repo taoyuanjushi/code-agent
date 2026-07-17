@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -10,10 +11,32 @@ from typing import Any
 from pathspec.patterns import GitWildMatchPattern
 
 from .ignore import DEFAULT_IGNORES, IgnorePolicy, load_ignore_policy
-from .path_safety import resolve_inside_workspace
+from .path_safety import (
+    is_link_or_reparse_point,
+    resolve_workspace_path,
+)
+from .security.path_policy import SensitivePathPolicy, load_sensitive_path_policy
 
 _RG_ERROR_LIMIT = 2_000
 _RG_TIMEOUT_SECONDS = 30
+_RG_SENSITIVE_EXCLUDES = (
+    "!**/.env",
+    "!**/.npmrc",
+    "!**/.pypirc",
+    "!**/.netrc",
+    "!**/credentials",
+    "!**/credentials.json",
+    "!**/.ssh/**",
+    "!**/.aws/**",
+    "!**/.config/gcloud/**",
+    "!**/id_rsa",
+    "!**/id_ed25519",
+    "!**/*.pem",
+    "!**/*.key",
+    "!**/*.p12",
+    "!**/*.pfx",
+    "!**/.coding-agent/**",
+)
 
 
 @dataclass(frozen=True)
@@ -65,7 +88,15 @@ def search_text(
         raise ValueError("max_line_length must be a positive integer.")
 
     root = Path(workspace).resolve()
-    start = resolve_inside_workspace(root, path)
+    start = resolve_workspace_path(
+        root,
+        path,
+        operation="search",
+        allow_missing=False,
+    )
+    sensitive_policy = load_sensitive_path_policy(root)
+    if not sensitive_policy.evaluate(start, operation="search").allowed:
+        return []
     if not start.exists():
         raise ValueError(f"Search path does not exist: {path}")
 
@@ -89,6 +120,7 @@ def search_text(
                 regex=regex,
                 glob_matcher=glob_matcher,
                 ignore_policy=ignore_policy,
+                sensitive_policy=sensitive_policy,
                 rg_path=rg_path,
             )
         except FileNotFoundError:
@@ -105,6 +137,7 @@ def search_text(
         regex=regex,
         glob_matcher=glob_matcher,
         ignore_policy=ignore_policy,
+        sensitive_policy=sensitive_policy,
     )
 
 
@@ -128,6 +161,7 @@ def _search_with_rg(
     regex: bool,
     glob_matcher: _GlobMatcher,
     ignore_policy: IgnorePolicy,
+    sensitive_policy: SensitivePathPolicy,
     rg_path: str,
 ) -> list[SearchMatch]:
     search_path = _relative_search_path(root, start)
@@ -153,8 +187,16 @@ def _search_with_rg(
         args.extend(["--glob", f"!**/{ignored_name}/**"])
     for glob_pattern in glob_matcher.patterns:
         args.extend(["--glob", glob_pattern])
+    for sensitive_glob in _RG_SENSITIVE_EXCLUDES:
+        args.extend(["--glob", sensitive_glob])
 
     args.extend(["--", pattern, search_path])
+    start = resolve_workspace_path(
+        root,
+        search_path,
+        operation="search",
+        allow_missing=False,
+    )
     completed = subprocess.run(
         args,
         cwd=root,
@@ -183,6 +225,7 @@ def _search_with_rg(
         stdout,
         root=root,
         ignore_policy=ignore_policy,
+        sensitive_policy=sensitive_policy,
         glob_matcher=glob_matcher,
         max_results=max_results,
         max_line_length=max_line_length,
@@ -200,11 +243,17 @@ def _search_with_python(
     regex: bool,
     glob_matcher: _GlobMatcher,
     ignore_policy: IgnorePolicy,
+    sensitive_policy: SensitivePathPolicy,
 ) -> list[SearchMatch]:
     if start.is_file():
         files = [start]
     else:
-        files = _iter_search_files(root, start, ignore_policy)
+        files = _iter_search_files(
+            root,
+            start,
+            ignore_policy,
+            sensitive_policy,
+        )
 
     compiled_pattern: re.Pattern[str] | None = None
     if regex:
@@ -219,10 +268,16 @@ def _search_with_python(
 
     for file_path in files:
         relative_path = file_path.relative_to(root).as_posix()
-        if not glob_matcher.matches(relative_path):
+        if (
+            not sensitive_policy.evaluate(
+                file_path,
+                operation="search",
+            ).allowed
+            or not glob_matcher.matches(relative_path)
+        ):
             continue
 
-        text = _read_searchable_text(file_path)
+        text = _read_searchable_text(root, file_path)
         if text is None:
             continue
 
@@ -256,6 +311,7 @@ def _parse_rg_matches(
     *,
     root: Path,
     ignore_policy: IgnorePolicy,
+    sensitive_policy: SensitivePathPolicy,
     glob_matcher: _GlobMatcher,
     max_results: int,
     max_line_length: int,
@@ -292,10 +348,22 @@ def _parse_rg_matches(
         if path_text is None or line_text is None or line_bytes is None:
             continue
 
-        candidate = resolve_inside_workspace(root, path_text.replace("\\", "/"))
+        try:
+            candidate = resolve_workspace_path(
+                root,
+                path_text.replace("\\", "/"),
+                operation="search",
+                allow_missing=False,
+            )
+        except (OSError, ValueError):
+            continue
         relative_path = candidate.relative_to(root).as_posix()
         if (
             ignore_policy.is_ignored(candidate)
+            or not sensitive_policy.evaluate(
+                candidate,
+                operation="search",
+            ).allowed
             or ignore_policy.is_binary(candidate)
             or not glob_matcher.matches(relative_path)
         ):
@@ -336,20 +404,73 @@ def _iter_search_files(
     root: Path,
     start: Path,
     ignore_policy: IgnorePolicy,
+    sensitive_policy: SensitivePathPolicy,
 ) -> list[Path]:
     files: list[Path] = []
-    for path in start.rglob("*"):
-        if (
-            not path.is_file()
-            or ignore_policy.is_ignored(path)
-            or ignore_policy.is_binary(path)
-        ):
-            continue
-        files.append(path)
+    for current_directory, directory_names, file_names in os.walk(
+        start,
+        topdown=True,
+        followlinks=False,
+    ):
+        directory = Path(current_directory)
+        retained_directories: list[str] = []
+        for name in sorted(directory_names):
+            candidate = directory / name
+            if is_link_or_reparse_point(candidate):
+                continue
+            try:
+                candidate = resolve_workspace_path(
+                    root,
+                    candidate,
+                    operation="search",
+                    allow_missing=False,
+                )
+            except (OSError, ValueError):
+                continue
+            if (
+                ignore_policy.is_ignored(candidate)
+                or not sensitive_policy.evaluate(
+                    candidate,
+                    operation="search",
+                ).allowed
+            ):
+                continue
+            retained_directories.append(name)
+        directory_names[:] = retained_directories
+
+        for name in sorted(file_names):
+            candidate = directory / name
+            try:
+                candidate = resolve_workspace_path(
+                    root,
+                    candidate,
+                    operation="search",
+                    allow_missing=False,
+                )
+            except (OSError, ValueError):
+                continue
+            if (
+                not candidate.is_file()
+                or ignore_policy.is_ignored(candidate)
+                or ignore_policy.is_binary(candidate)
+                or not sensitive_policy.evaluate(
+                    candidate,
+                    operation="search",
+                ).allowed
+            ):
+                continue
+            files.append(candidate)
+
     return sorted(files, key=lambda candidate: candidate.relative_to(root).as_posix())
 
 
-def _read_searchable_text(path: Path) -> str | None:
+def _read_searchable_text(root: Path, path: Path) -> str | None:
+    path = resolve_workspace_path(
+        root,
+        path,
+        operation="search",
+        allow_missing=False,
+    )
     data = path.read_bytes()
     if b"\0" in data[:8000]:
         return None

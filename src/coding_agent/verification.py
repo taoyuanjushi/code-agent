@@ -4,24 +4,41 @@ import json
 from pathlib import Path
 import re
 import shutil
-import subprocess as _subprocess
 import sys
 import time
 import tomllib
 from typing import Any, Callable, Literal
 
-from .path_safety import resolve_inside_workspace
+from .path_safety import resolve_workspace_path
+from .security.command_policy import (
+    evaluate_command_policy,
+    format_command_policy_block,
+)
+from .security.models import (
+    CommandPolicyDecision,
+    CommandSpec,
+    ExecutionLimits,
+)
+from .security.process_runner import (
+    HostProcessAuthorizationError,
+    run_host_process,
+)
 
 
-class _SubprocessProxy:
-    """Keep verification monkeypatches isolated from other subprocess users."""
+def resolve_inside_workspace(
+    workspace: str | Path,
+    requested_path: str | Path,
+) -> Path:
+    """Compatibility seam for strict verification cwd validation."""
 
-    run = staticmethod(_subprocess.run)
-    TimeoutExpired = _subprocess.TimeoutExpired
-    DEVNULL = _subprocess.DEVNULL
+    return resolve_workspace_path(
+        workspace,
+        requested_path,
+        operation="execute",
+        allow_missing=False,
+    )
 
 
-subprocess = _SubprocessProxy()
 
 VerificationKind = Literal["test", "lint", "typecheck", "build"]
 VerificationStatus = Literal[
@@ -298,7 +315,7 @@ def discover_python_verification_commands(
     workspace: str | Path,
 ) -> VerificationDiscoveryResult:
     """Discover safe Python verification commands from root-level evidence."""
-    workspace_path = Path(workspace).resolve()
+    workspace_path = _resolve_discovery_workspace(workspace)
     candidates: dict[VerificationKind, _PythonCommandCandidate] = {}
     errors: list[str] = []
 
@@ -312,7 +329,12 @@ def discover_python_verification_commands(
         ("setup.cfg", 90),
     )
     for config_name, priority in root_test_configs:
-        if (workspace_path / config_name).is_file():
+        config_path = _resolve_discovery_path(
+            workspace_path,
+            config_name,
+            operation="read",
+        )
+        if config_path is not None and config_path.is_file():
             _add_python_candidate(
                 candidates,
                 command_id="python:pytest",
@@ -323,7 +345,12 @@ def discover_python_verification_commands(
                 priority=priority,
             )
 
-    if (workspace_path / "tests").is_dir():
+    tests_path = _resolve_discovery_path(
+        workspace_path,
+        "tests",
+        operation="list",
+    )
+    if tests_path is not None and tests_path.is_dir():
         _add_python_candidate(
             candidates,
             command_id="python:pytest",
@@ -369,11 +396,22 @@ def _load_root_pyproject(
     workspace: Path,
     errors: list[str],
 ) -> dict[str, Any] | None:
-    path = workspace / "pyproject.toml"
-    if not path.is_file():
+    path = _resolve_discovery_path(
+        workspace,
+        "pyproject.toml",
+        operation="read",
+    )
+    if path is None or not path.is_file():
         return None
 
     try:
+        path = _resolve_discovery_path(
+            workspace,
+            "pyproject.toml",
+            operation="read",
+        )
+        if path is None:
+            return None
         with path.open("rb") as pyproject_file:
             return tomllib.load(pyproject_file)
     except tomllib.TOMLDecodeError as exc:
@@ -546,7 +584,7 @@ def discover_typescript_verification_commands(
     workspace: str | Path,
 ) -> VerificationDiscoveryResult:
     """Discover root package scripts without expanding their shell content."""
-    workspace_path = Path(workspace).resolve()
+    workspace_path = _resolve_discovery_workspace(workspace)
     warnings: list[str] = []
     errors: list[str] = []
     package = _load_root_package_json(workspace_path, errors)
@@ -615,11 +653,22 @@ def _load_root_package_json(
     workspace: Path,
     errors: list[str],
 ) -> dict[str, Any] | None:
-    path = workspace / "package.json"
-    if not path.is_file():
+    path = _resolve_discovery_path(
+        workspace,
+        "package.json",
+        operation="read",
+    )
+    if path is None or not path.is_file():
         return None
 
     try:
+        path = _resolve_discovery_path(
+            workspace,
+            "package.json",
+            operation="read",
+        )
+        if path is None:
+            return None
         package = json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         errors.append(f"Failed to parse package.json: {exc}")
@@ -656,13 +705,48 @@ def _select_package_manager(
         )
 
     for lockfile, manager in _PACKAGE_MANAGER_LOCKFILES:
-        if (workspace / lockfile).is_file():
+        lockfile_path = _resolve_discovery_path(
+            workspace,
+            lockfile,
+            operation="read",
+        )
+        if lockfile_path is not None and lockfile_path.is_file():
             return manager
 
     warnings.append(
         "No packageManager field or lockfile found; defaulting to npm."
     )
     return "npm"
+
+
+def _resolve_discovery_workspace(workspace: str | Path) -> Path:
+    """Validate the discovery root before inspecting verification metadata."""
+
+    return resolve_workspace_path(
+        workspace,
+        ".",
+        operation="execute",
+        allow_missing=False,
+    )
+
+
+def _resolve_discovery_path(
+    workspace: Path,
+    relative_path: str,
+    *,
+    operation: Literal["list", "read"],
+) -> Path | None:
+    """Return an existing safe discovery path without following unsafe links."""
+
+    try:
+        return resolve_workspace_path(
+            workspace,
+            relative_path,
+            operation=operation,
+            allow_missing=False,
+        )
+    except (FileNotFoundError, OSError, ValueError):
+        return None
 
 
 def _declares_workspaces(value: object) -> bool:
@@ -815,6 +899,65 @@ def discover_verification_commands(
     )
 
 
+
+def evaluate_verification_command_policy(
+    workspace: str | Path,
+    *,
+    command_id: str,
+    command: VerificationCommand,
+    discovery: VerificationDiscoveryResult,
+    timeout_ms: int = DEFAULT_VERIFICATION_TIMEOUT_MS,
+    max_output_bytes: int = DEFAULT_VERIFICATION_MAX_OUTPUT_BYTES,
+    max_output_lines: int = DEFAULT_VERIFICATION_MAX_OUTPUT_LINES,
+) -> CommandPolicyDecision:
+    """Evaluate a discovered verification command before approval or execution."""
+
+    spec = build_verification_command_spec(
+        workspace,
+        command_id=command_id,
+        command=command,
+        discovery=discovery,
+        timeout_ms=timeout_ms,
+        max_output_bytes=max_output_bytes,
+        max_output_lines=max_output_lines,
+    )
+    return evaluate_command_policy(
+        spec,
+        verification_command_id=command_id,
+        discovered_commands=discovery.commands,
+    )
+
+
+def build_verification_command_spec(
+    workspace: str | Path,
+    *,
+    command_id: str,
+    command: VerificationCommand,
+    discovery: VerificationDiscoveryResult,
+    timeout_ms: int,
+    max_output_bytes: int,
+    max_output_lines: int,
+) -> CommandSpec:
+    workspace_path = Path(workspace).resolve()
+    if Path(discovery.workspace).resolve() != workspace_path:
+        raise ValueError(
+            "Verification discovery workspace does not match execution workspace."
+        )
+    resolved_cwd = resolve_inside_workspace(workspace_path, command.cwd)
+    relative_cwd = resolved_cwd.relative_to(workspace_path).as_posix()
+    return CommandSpec(
+        argv=command.argv,
+        cwd=relative_cwd,
+        source="verification",
+        purpose=f"Run discovered verification command {command_id}",
+        limits=ExecutionLimits(
+            timeout_ms=timeout_ms,
+            max_output_bytes=max_output_bytes,
+            max_output_lines=max_output_lines,
+        ),
+    )
+
+
 def run_verification_command(
     workspace: str | Path,
     *,
@@ -891,6 +1034,33 @@ def run_verification_command(
             max_output_lines=max_output_lines,
         )
 
+    command_spec = build_verification_command_spec(
+        workspace_path,
+        command_id=command_id,
+        command=command,
+        discovery=discovery,
+        timeout_ms=timeout_ms,
+        max_output_bytes=max_output_bytes,
+        max_output_lines=max_output_lines,
+    )
+    policy_decision = evaluate_command_policy(
+        command_spec,
+        verification_command_id=command_id,
+        discovered_commands=discovery.commands,
+    )
+    if policy_decision.disposition in {"deny", "sandbox_required"}:
+        return _execution_result(
+            command,
+            status="error",
+            output=format_command_policy_block(policy_decision),
+            exit_code=None,
+            started=started,
+            attempt=attempt,
+            max_output_bytes=max_output_bytes,
+            max_output_lines=max_output_lines,
+        )
+
+    approval_granted = False
     if approval_callback is not None:
         try:
             approved = approval_callback(command)
@@ -927,47 +1097,20 @@ def run_verification_command(
                 max_output_bytes=max_output_bytes,
                 max_output_lines=max_output_lines,
             )
+        approval_granted = True
 
     try:
-        completed = subprocess.run(
-            command.argv,
-            cwd=command.cwd,
-            shell=False,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            timeout=timeout_ms / 1000,
+        process_result = run_host_process(
+            workspace_path,
+            command_spec,
+            policy_decision,
+            approval_granted=approval_granted,
         )
-    except subprocess.TimeoutExpired as exc:
-        return _execution_result(
-            command,
-            status="timed_out",
-            stdout=_coerce_process_text(exc.stdout),
-            stderr=_coerce_process_text(exc.stderr),
-            exit_code=None,
-            started=started,
-            attempt=attempt,
-            max_output_bytes=max_output_bytes,
-            max_output_lines=max_output_lines,
-        )
-    except FileNotFoundError as exc:
-        return _execution_result(
-            command,
-            status="not_found",
-            output=str(exc) or f"Runtime not found: {command.argv[0]}",
-            exit_code=None,
-            started=started,
-            attempt=attempt,
-            max_output_bytes=max_output_bytes,
-            max_output_lines=max_output_lines,
-        )
-    except OSError as exc:
+    except HostProcessAuthorizationError as exc:
         return _execution_result(
             command,
             status="error",
-            output=str(exc) or "Failed to start verification command.",
+            output=str(exc),
             exit_code=None,
             started=started,
             attempt=attempt,
@@ -975,17 +1118,40 @@ def run_verification_command(
             max_output_lines=max_output_lines,
         )
 
-    status = classify_verification_status(exit_code=completed.returncode)
+    if process_result.status in {"not_found", "error"}:
+        return _execution_result(
+            command,
+            status=process_result.status,
+            output=(
+                process_result.error_reason
+                or "Failed to start verification command."
+            ),
+            exit_code=None,
+            started=started,
+            attempt=attempt,
+            max_output_bytes=max_output_bytes,
+            max_output_lines=max_output_lines,
+            duration_ms=process_result.duration_ms,
+        )
+
+    status = (
+        "timed_out"
+        if process_result.status == "timed_out"
+        else classify_verification_status(exit_code=process_result.exit_code)
+    )
     return _execution_result(
         command,
         status=status,
-        stdout=_coerce_process_text(completed.stdout),
-        stderr=_coerce_process_text(completed.stderr),
-        exit_code=completed.returncode,
+        stdout=process_result.stdout,
+        stderr=process_result.stderr,
+        exit_code=process_result.exit_code,
         started=started,
         attempt=attempt,
         max_output_bytes=max_output_bytes,
         max_output_lines=max_output_lines,
+        duration_ms=process_result.duration_ms,
+        upstream_omitted_lines=process_result.omitted_lines,
+        upstream_omitted_bytes=process_result.omitted_bytes,
     )
 
 
@@ -1138,6 +1304,9 @@ def _execution_result(
     attempt: int,
     max_output_bytes: int,
     max_output_lines: int,
+    duration_ms: int | None = None,
+    upstream_omitted_lines: int = 0,
+    upstream_omitted_bytes: int = 0,
 ) -> VerificationResult:
     if output is None:
         effective_max_bytes = max_output_bytes
@@ -1172,7 +1341,13 @@ def _execution_result(
             omitted_bytes=omitted_bytes,
         )
 
-    duration_ms = max(0, int((time.monotonic() - started) * 1000))
+    effective_duration_ms = (
+        max(0, int((time.monotonic() - started) * 1000))
+        if duration_ms is None
+        else max(0, duration_ms)
+    )
+    total_omitted_lines = summary.omitted_lines + upstream_omitted_lines
+    total_omitted_bytes = summary.omitted_bytes + upstream_omitted_bytes
     return VerificationResult(
         command_id=command.id,
         kind=command.kind,
@@ -1180,23 +1355,14 @@ def _execution_result(
         argv=command.argv,
         cwd=command.cwd,
         exit_code=exit_code,
-        duration_ms=duration_ms,
+        duration_ms=effective_duration_ms,
         output=summary.output,
-        truncated=summary.truncated,
-        omitted_lines=summary.omitted_lines,
-        omitted_bytes=summary.omitted_bytes,
+        truncated=bool(total_omitted_lines or total_omitted_bytes),
+        omitted_lines=total_omitted_lines,
+        omitted_bytes=total_omitted_bytes,
         attempt=attempt,
     )
 
-
-def _coerce_process_text(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    if isinstance(value, str):
-        return value
-    return str(value)
 
 
 def _limit_verification_output(

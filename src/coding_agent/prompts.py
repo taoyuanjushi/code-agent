@@ -23,7 +23,7 @@ Verification workflow:
 7. In the final answer, report the commands run and their final statuses, plus any skipped checks and the reason they were skipped.
 8. Stop applying patches when the repair limit is reached, and explicitly report the unresolved verification failure.
 
-Treat these sequences as guidance rather than a hardcoded requirement. Skip stages that do not apply, but gather file-content evidence before editing or making implementation claims. Use run_command only when no trusted discovered verification command covers the required check."""
+Treat these sequences as guidance rather than a hardcoded requirement. Skip stages that do not apply, but gather file-content evidence before editing or making implementation claims. Use run_command only when no trusted discovered verification command covers the required check, and always pass a non-empty argv array rather than shell text."""
 
 
 def build_system_prompt(
@@ -59,13 +59,20 @@ Goal:
 Execution rules:
 - Workspace root: {config.workspace}
 - Permission mode: {config.permission_mode}
+- Sandbox mode: {config.sandbox_mode}
+- Docker sandbox image: {config.sandbox_image}
 - Read files before proposing edits.
 - Use read_many_files when implementation, tests, or configuration should be inspected together.
 - In read-only mode, do not call apply_patch or run commands that modify files.
 - In workspace-write mode, write only inside the workspace.
 - All file edits must use apply_patch; write_file is intentionally unavailable.
 - Prefer discover_verification_commands and run_verification for project checks; they prevent arbitrary argv injection and return structured results.
-- Use run_command for inspection or checks that discovery cannot represent, not as a substitute for editing files.
+- Use run_command for inspection or checks that discovery cannot represent, not as a substitute for editing files; pass argv items directly and never provide a shell command string.
+- Never request a shell, command wrapper, inline interpreter, dependency installation, network access, or secret/environment credential access through run_command.
+- Never use run_command to bypass the dedicated read, search, patch, or verification tools or their path and command policies.
+- Command policy is evaluated before approval: hard-deny decisions cannot be approved, and sandbox-required decisions never fall back to host execution.
+- Unknown run_command argv fails closed to sandbox-required; when policy denies a command or no sandbox backend is available, use a safe dedicated tool or explain the limitation. Never rewrite, split, wrap, or otherwise disguise the command to evade the decision.
+- Command and verification results use secure_command_result metadata; check status, backend, sandboxed, policy rule, timeout, truncation, and cleanup fields before drawing conclusions.
 - Use git_status and git_diff after edits when available.
 - Explain important actions before taking them.
 - Avoid destructive commands unless the user explicitly asks for them.

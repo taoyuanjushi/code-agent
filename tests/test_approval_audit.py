@@ -6,6 +6,8 @@ from typing import Any
 
 import pytest
 
+from tests.process_fakes import patch_tools_runner, patch_verification_runner
+
 import coding_agent.tools as tools_module
 import coding_agent.verification as verification_module
 from coding_agent.agent import run_agent_with_report
@@ -105,12 +107,12 @@ def test_approval_request_codec_round_trip() -> None:
         call_id="call-1",
         action="run_command",
         summary="Run tests",
-        arguments_sha256=hash_tool_arguments('{"command":"pytest"}'),
+        arguments_sha256=hash_tool_arguments('{"argv":["pytest"]}'),
         details={
-            "command": "pytest",
+            "argv": ("pytest",),
             "cwd": "D:/code/project",
             "timeout_ms": 30_000,
-            "shell": True,
+            "shell": False,
         },
     )
 
@@ -185,29 +187,50 @@ def test_auto_approved_edit_and_command_are_audited(
             _call(
                 "run_command",
                 "call-command",
-                {"command": "echo audit", "timeout_ms": 1_234},
+                {"argv": ["echo", "audit"], "timeout_ms": 1_234},
             ),
         ]
     )
     store = SessionStore(tmp_path)
 
-    def fake_shell(command: str, cwd: str, timeout_ms: int) -> ToolResult:
+    def fake_argv(
+        argv: tuple[str, ...],
+        workspace: str | Path,
+        cwd: str,
+        timeout_ms: int,
+        *,
+        policy_decision: object,
+        approval_granted: bool,
+        command_spec: object,
+    ) -> ToolResult:
         return ToolResult(
             ok=True,
             output="exit code: 0\naudit",
             data={
-                "type": "command_result",
-                "command": command,
-                "cwd": str(Path(cwd).resolve()),
-                "shell": True,
+                "type": "secure_command_result",
+                "argv": list(argv),
+                "cwd": cwd,
+                "shell": False,
                 "timeout_ms": timeout_ms,
+                "backend": "host",
+                "sandboxed": False,
+                "network_mode": "host",
+                "image_digest": None,
                 "exit_code": 0,
                 "timed_out": False,
                 "duration_ms": 1,
+                "status": "passed",
+                "policy_version": policy_decision.policy_version,
+                "rule_id": policy_decision.rule_id,
+                "disposition": policy_decision.disposition,
+                "reasons": list(policy_decision.reasons),
+                "normalized_executable": policy_decision.normalized_executable,
+                "requires_approval": policy_decision.requires_approval,
+                "requires_sandbox": policy_decision.requires_sandbox,
             },
         )
 
-    monkeypatch.setattr(tools_module, "_run_shell_command", fake_shell)
+    monkeypatch.setattr(tools_module, "_run_argv_command", fake_argv)
 
     report = run_agent_with_report(
         "edit and inspect",
@@ -230,19 +253,52 @@ def test_auto_approved_edit_and_command_are_audited(
         "apply_patch",
         "run_command",
     ]
+    policy_event = next(
+        event
+        for event in events
+        if event.type == "security.policy_evaluated"
+    )
+    command_started = next(
+        event
+        for event in events
+        if event.type == "tool.started"
+        and event.payload["name"] == "run_command"
+    )
+    command_approval = next(
+        event
+        for event in approvals
+        if event.payload["decision"]["action"] == "run_command"
+    )
+    assert command_started.seq < policy_event.seq < command_approval.seq
+    assert policy_event.payload["policy"]["rule_id"] == "allow.interactive_host"
     command_finished = next(
         event
         for event in events
         if event.type == "tool.finished" and event.payload["name"] == "run_command"
     )
-    assert command_finished.payload["execution"] == {
-        "command": "echo audit",
-        "cwd": str(tmp_path.resolve()),
-        "shell": True,
+    execution = command_finished.payload["execution"]
+    assert execution == {
+        "argv": ("echo", "audit"),
+        "cwd": ".",
+        "shell": False,
         "timeout_ms": 1_234,
+        "backend": "host",
+        "sandboxed": False,
+        "network_mode": "host",
+        "image_digest": None,
         "exit_code": 0,
         "timed_out": False,
         "duration_ms": 1,
+        "status": "passed",
+        "policy_version": 1,
+        "rule_id": "allow.interactive_host",
+        "disposition": "approval_required",
+        "reasons": (
+            "This narrowly scoped host command requires explicit approval.",
+        ),
+        "normalized_executable": "echo",
+        "requires_approval": True,
+        "requires_sandbox": False,
     }
 
 
@@ -252,7 +308,7 @@ def test_denial_is_persisted_and_prevents_command_execution(
 ) -> None:
     store = SessionStore(tmp_path)
     client = _ToolClient(
-        [_call("run_command", "call-denied", {"command": "echo denied"})]
+        [_call("run_command", "call-denied", {"argv": ["echo", "denied"]})]
     )
 
     def denied(request: ApprovalRequest) -> ApprovalDecision:
@@ -262,10 +318,10 @@ def test_denial_is_persisted_and_prevents_command_execution(
             source="interactive",
         )
 
-    def forbidden_shell(*_args: object, **_kwargs: object) -> ToolResult:
+    def forbidden_argv(*_args: object, **_kwargs: object) -> ToolResult:
         raise AssertionError("denied command must not execute")
 
-    monkeypatch.setattr(tools_module, "_run_shell_command", forbidden_shell)
+    monkeypatch.setattr(tools_module, "_run_argv_command", forbidden_argv)
 
     report = run_agent_with_report(
         "do not run",
@@ -403,9 +459,8 @@ def test_verification_approval_and_result_preserve_exact_execution_metadata(
         "_python_module_available",
         lambda _name: True,
     )
-    monkeypatch.setattr(
-        verification_module.subprocess,
-        "run",
+    patch_verification_runner(
+        monkeypatch,
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
             stdout="1 passed\n",
@@ -443,22 +498,24 @@ def test_verification_approval_and_result_preserve_exact_execution_metadata(
     assert result.data["shell"] is False
 
 
-def test_run_command_result_records_command_cwd_timeout_and_exit_status(
+def test_run_command_result_records_argv_cwd_timeout_and_exit_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_kwargs: dict[str, object] = {}
 
-    def fake_run(command: str, **kwargs: object) -> SimpleNamespace:
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         captured_kwargs.update(kwargs)
-        assert command == "echo audit"
+        assert argv == ["echo", "audit"]
         return SimpleNamespace(returncode=7, stdout="out\n", stderr="err\n")
 
-    monkeypatch.setattr(tools_module.subprocess, "run", fake_run)
+    patch_tools_runner(monkeypatch, fake_run)
 
     def approve(request: ApprovalRequest) -> ApprovalDecision:
-        assert request.details["command"] == "echo audit"
-        assert request.details["cwd"] == str(tmp_path.resolve())
+        assert request.details["argv"] == ("echo", "audit")
+        assert request.details["cwd"] == "."
+        assert request.details["backend"] == "host"
+        assert request.details["sandboxed"] is False
         assert request.details["timeout_ms"] == 2_500
         return create_approval_decision(
             request,
@@ -469,16 +526,16 @@ def test_run_command_result_records_command_cwd_timeout_and_exit_status(
     result = execute_tool(
         _config(tmp_path),
         "run_command",
-        json.dumps({"command": "echo audit", "timeout_ms": 2_500}),
+        json.dumps({"argv": ["echo", "audit"], "timeout_ms": 2_500}),
         approval_handler=approve,
         call_id="call-command",
     )
 
     assert result.ok is False
     assert result.data is not None
-    assert result.data["command"] == "echo audit"
-    assert result.data["cwd"] == str(tmp_path.resolve())
-    assert result.data["shell"] is True
+    assert result.data["argv"] == ["echo", "audit"]
+    assert result.data["cwd"] == "."
+    assert result.data["shell"] is False
     assert result.data["timeout_ms"] == 2_500
     assert result.data["exit_code"] == 7
     assert result.data["timed_out"] is False

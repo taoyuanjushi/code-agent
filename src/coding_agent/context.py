@@ -1,7 +1,10 @@
+import os
 from pathlib import Path
 
 from .ignore import load_ignore_policy
+from .path_safety import is_link_or_reparse_point, resolve_workspace_path
 from .ranking import rank_files, task_mentions_file
+from .security.path_policy import load_sensitive_path_policy
 from .types import WorkspaceFile, WorkspaceSample, WorkspaceSnapshot
 
 DEFAULT_MAX_INVENTORY_FILES = 400
@@ -42,26 +45,73 @@ def collect_workspace_snapshot(
 
     root = Path(workspace).resolve()
     ignore_policy = load_ignore_policy(root)
+    sensitive_policy = load_sensitive_path_policy(root)
     discovered_files: list[WorkspaceFile] = []
 
-    for path in root.rglob("*"):
-        is_instruction_file = path.name == "AGENTS.md"
-        is_ignored = ignore_policy.is_ignored(path)
-        is_visible_instruction = (
-            is_instruction_file
-            and not ignore_policy.is_ignored(path.parent)
-        )
-        if (
-            not path.is_file()
-            or (is_ignored and not is_visible_instruction)
-            or ignore_policy.is_binary(path)
-        ):
-            continue
+    for current_directory, directory_names, file_names in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        directory = Path(current_directory)
+        retained_directories: list[str] = []
+        for name in sorted(directory_names):
+            candidate = directory / name
+            if is_link_or_reparse_point(candidate):
+                continue
+            try:
+                candidate = resolve_workspace_path(
+                    root,
+                    candidate,
+                    operation="snapshot",
+                    allow_missing=False,
+                )
+            except (OSError, ValueError):
+                continue
+            if (
+                ignore_policy.is_ignored(candidate)
+                or not sensitive_policy.evaluate(
+                    candidate,
+                    operation="snapshot",
+                ).allowed
+            ):
+                continue
+            retained_directories.append(name)
+        directory_names[:] = retained_directories
 
-        relative = path.relative_to(root).as_posix()
-        discovered_files.append(
-            WorkspaceFile(path=relative, size=path.stat().st_size)
-        )
+        for name in sorted(file_names):
+            requested = directory / name
+            try:
+                candidate = resolve_workspace_path(
+                    root,
+                    requested,
+                    operation="snapshot",
+                    allow_missing=False,
+                )
+            except (OSError, ValueError):
+                continue
+            if not sensitive_policy.evaluate(
+                candidate,
+                operation="snapshot",
+            ).allowed:
+                continue
+            is_instruction_file = candidate.name == "AGENTS.md"
+            is_ignored = ignore_policy.is_ignored(candidate)
+            is_visible_instruction = (
+                is_instruction_file
+                and not ignore_policy.is_ignored(candidate.parent)
+            )
+            if (
+                not candidate.is_file()
+                or (is_ignored and not is_visible_instruction)
+                or ignore_policy.is_binary(candidate)
+            ):
+                continue
+
+            relative = candidate.relative_to(root).as_posix()
+            discovered_files.append(
+                WorkspaceFile(path=relative, size=candidate.stat().st_size)
+            )
 
     files_by_path = {file.path: file for file in discovered_files}
     ranked_files = [
@@ -85,7 +135,13 @@ def collect_workspace_snapshot(
             break
 
         sample_budget = min(max_bytes_per_file, remaining_bytes)
-        content = _read_text_slice(root / relative_path, sample_budget)
+        sample_path = root / relative_path
+        if not sensitive_policy.evaluate(
+            sample_path,
+            operation="snapshot",
+        ).allowed:
+            continue
+        content = _read_text_slice(root, sample_path, sample_budget)
         if content is None:
             continue
 
@@ -169,7 +225,13 @@ def _select_sample_files(
     return selected
 
 
-def _read_text_slice(path: Path, max_bytes: int) -> str | None:
+def _read_text_slice(root: Path, path: Path, max_bytes: int) -> str | None:
+    path = resolve_workspace_path(
+        root,
+        path,
+        operation="snapshot",
+        allow_missing=False,
+    )
     probe_size = max(max_bytes, 8_000)
     with path.open("rb") as stream:
         data = stream.read(probe_size)

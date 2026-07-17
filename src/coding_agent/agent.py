@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -30,6 +30,8 @@ from .model_client import (
     normalize_model_response,
 )
 from .prompts import build_system_prompt, build_user_prompt
+from .security.docker_backend import DockerSandboxBackend
+from .security.models import SECURITY_POLICY_VERSION
 from .sessions.codec import (
     approval_decision_to_dict,
     approval_request_to_dict,
@@ -187,6 +189,10 @@ class ResumeTurnLimitError(SessionResumeError):
 
 class ResumeModelContextUnavailable(SessionResumeError):
     code = "resume_model_context_unavailable"
+
+
+class SessionSecurityDriftError(SessionResumeError):
+    code = "session_security_drift"
 
 
 class _AgentTurnLimitError(RuntimeError):
@@ -365,6 +371,7 @@ def resume_agent_with_report(
 
         started = _session_started_from_events(events)
         config = _resume_config(started, workspace_path)
+        _validate_resume_security(events, started, config, workspace_path)
         recovery_plans = plan_interrupted_tools(
             workspace_path,
             events,
@@ -411,6 +418,12 @@ def resume_agent_with_report(
 
         try:
             client = model_client
+            recovery_plans = _reconcile_interrupted_sandboxes(
+                journal,
+                events,
+                config,
+                recovery_plans,
+            )
             recovery_call_ids.update(
                 _apply_recovery_plans(journal, recovery_plans)
             )
@@ -780,6 +793,28 @@ def _resume_config(
         raise SessionResumeError(
             f"Unsupported persisted permission mode: {permission_mode!r}."
         )
+    sandbox_mode = config.get("sandbox_mode", "none")
+    if sandbox_mode not in {"none", "auto", "docker"}:
+        raise SessionResumeError(
+            f"Unsupported persisted sandbox mode: {sandbox_mode!r}."
+        )
+    sandbox_image = config.get("sandbox_image", "python:3.12-slim")
+    if not isinstance(sandbox_image, str) or not sandbox_image:
+        raise SessionResumeError(
+            "Persisted session config 'sandbox_image' must be a non-empty string."
+        )
+    sandbox_image_digest = config.get("sandbox_image_digest")
+    if sandbox_image_digest is not None and (
+        not isinstance(sandbox_image_digest, str) or not sandbox_image_digest
+    ):
+        raise SessionResumeError(
+            "Persisted session config 'sandbox_image_digest' must be a string or null."
+        )
+    full_auto = config.get("full_auto", False)
+    if not isinstance(full_auto, bool):
+        raise SessionResumeError(
+            "Persisted session config 'full_auto' must be a boolean."
+        )
     return AgentConfig(
         workspace=str(workspace),
         model=model,
@@ -794,7 +829,141 @@ def _resume_config(
             "context_max_bytes_per_file",
         ),
         max_fix_attempts=_resume_positive_int(config, "max_fix_attempts"),
+        sandbox_mode=cast(Any, sandbox_mode),
+        sandbox_image=sandbox_image,
+        sandbox_image_digest=sandbox_image_digest,
+        full_auto=full_auto,
     )
+
+
+def _validate_resume_security(
+    events: Sequence[SessionEvent],
+    started: SessionStarted,
+    config: AgentConfig,
+    workspace: Path,
+) -> None:
+    persisted_version = started.config.get("security_policy_version")
+    if persisted_version is not None and (
+        isinstance(persisted_version, bool)
+        or persisted_version != SECURITY_POLICY_VERSION
+    ):
+        raise SessionSecurityDriftError(
+            "Security policy version changed; refusing to resume."
+        )
+
+    digests: set[str] = set()
+    used_docker = config.sandbox_mode == "docker"
+    for event in events:
+        if event.type == "security.policy_evaluated":
+            policy = event.payload.get("policy")
+            if isinstance(policy, Mapping):
+                version = policy.get("policy_version")
+                if version != SECURITY_POLICY_VERSION:
+                    raise SessionSecurityDriftError(
+                        "Persisted command policy version changed; refusing to resume."
+                    )
+        if not event.type.startswith("sandbox."):
+            continue
+        used_docker = True
+        for source in (
+            event.payload,
+            event.payload.get("capability"),
+            event.payload.get("result"),
+        ):
+            if isinstance(source, Mapping):
+                digest = source.get("image_digest")
+                if isinstance(digest, str):
+                    digests.add(digest)
+
+    if config.sandbox_image_digest is not None:
+        digests.add(config.sandbox_image_digest)
+    if len(digests) > 1:
+        raise SessionSecurityDriftError(
+            "Persisted Docker image digests conflict; refusing to resume."
+        )
+    if not used_docker:
+        return
+
+    capability = DockerSandboxBackend(
+        image_reference=config.sandbox_image
+    ).probe_capability(workspace)
+    expected_digest = next(iter(digests), None)
+    if (
+        not capability.available
+        or capability.backend != "docker"
+        or capability.image_digest is None
+        or (
+            expected_digest is not None
+            and capability.image_digest != expected_digest
+        )
+    ):
+        raise SessionSecurityDriftError(
+            "Docker backend or image digest changed; refusing to resume."
+        )
+
+
+def _reconcile_interrupted_sandboxes(
+    journal: _SessionJournal,
+    events: Sequence[SessionEvent],
+    config: AgentConfig,
+    plans: Sequence[ToolRecoveryPlan],
+) -> tuple[ToolRecoveryPlan, ...]:
+    starts = {
+        event.payload.get("call_id"): event.payload
+        for event in events
+        if event.type == "sandbox.started"
+        and isinstance(event.payload.get("call_id"), str)
+    }
+    if not starts:
+        return tuple(plans)
+
+    backend = DockerSandboxBackend(image_reference=config.sandbox_image)
+    reconciled: list[ToolRecoveryPlan] = []
+    for plan in plans:
+        started = starts.get(plan.call_id)
+        if started is None or plan.effect != "process":
+            reconciled.append(plan)
+            continue
+        container_name = started.get("container_name")
+        if not isinstance(container_name, str):
+            raise SessionSecurityDriftError(
+                f"Interrupted sandbox {plan.call_id!r} has no container name."
+            )
+        _found, cleaned, error = backend.reconcile_interrupted_container(
+            config.workspace,
+            container_name,
+        )
+        if not cleaned:
+            journal.append(
+                "sandbox.cleanup_failed",
+                {
+                    "call_id": plan.call_id,
+                    "name": plan.name,
+                    "cleanup_kind": "container",
+                    "reason": error or "Interrupted container cleanup failed.",
+                },
+            )
+            raise SessionSecurityDriftError(
+                error or "Interrupted Docker container could not be cleaned."
+            )
+
+        safe_auto_retry = (
+            config.full_auto
+            and started.get("network_mode") == "none"
+            and started.get("snapshot_scope") == "temporary"
+            and started.get("image_digest") == config.sandbox_image_digest
+        )
+        reconciled.append(
+            replace(
+                plan,
+                disposition="safe_retry" if safe_auto_retry else plan.disposition,
+                reason="sandbox_reconciled" if safe_auto_retry else plan.reason,
+                approval_request=(
+                    None if safe_auto_retry else plan.approval_request
+                ),
+            )
+        )
+    return tuple(reconciled)
 
 
 def _persisted_text(
@@ -1029,6 +1198,21 @@ def _execute_tool_batch(
                 call.call_id,
                 approval_handler,
             )
+
+        def record_security_event(
+            event_type: str,
+            payload: Mapping[str, object],
+        ) -> None:
+            journal.append(
+                cast(SessionEventType, event_type),
+                {
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments_sha256": hash_tool_arguments(call.arguments),
+                    **payload,
+                },
+            )
+
         result = execute_tool(
             config,
             call.name,
@@ -1036,6 +1220,8 @@ def _execute_tool_batch(
             state=verification_state,
             approval_handler=call_approval_handler,
             call_id=call.call_id,
+            session_id=journal.session_id,
+            security_event_handler=record_security_event,
         )
         _inject_fault(fault_injector, "after_tool_side_effect")
         print("ok" if result.ok else "failed")
@@ -1100,15 +1286,67 @@ def _execute_tool_batch(
 
 def _execution_audit(data: Mapping[str, object]) -> dict[str, object] | None:
     data_type = data.get("type")
-    if data_type == "command_result":
+    if data_type == "command_batch_result":
+        commands = data.get("commands")
+        if not isinstance(commands, list):
+            return None
+        audits = [
+            audit
+            for command in commands
+            if isinstance(command, Mapping)
+            and (audit := _execution_audit(command)) is not None
+        ]
+        return {"commands": audits}
+
+    policy_keys = (
+        "policy_version",
+        "rule_id",
+        "disposition",
+        "reasons",
+        "normalized_executable",
+        "requires_approval",
+        "requires_sandbox",
+    )
+    if data_type == "secure_command_result":
         keys = (
-            "command",
+            "command_id",
+            "kind",
+            "argv",
+            "cwd",
+            "shell",
+            "timeout_ms",
+            "backend",
+            "sandboxed",
+            "network_mode",
+            "image_digest",
+            "exit_code",
+            "timed_out",
+            "duration_ms",
+            "status",
+            "verification_status",
+            "output_truncated",
+            "omitted_lines",
+            "omitted_bytes",
+            "error_reason",
+            "snapshot",
+            "snapshot_cleanup_succeeded",
+            "snapshot_cleanup_error",
+            "container_cleanup_attempted",
+            "container_cleanup_succeeded",
+            "container_cleanup_error",
+            *policy_keys,
+        )
+    elif data_type == "command_result":
+        keys = (
+            "argv",
             "cwd",
             "shell",
             "timeout_ms",
             "exit_code",
             "timed_out",
             "duration_ms",
+            "status",
+            *policy_keys,
         )
     elif data_type == "verification_result":
         keys = (
@@ -1122,6 +1360,7 @@ def _execution_audit(data: Mapping[str, object]) -> dict[str, object] | None:
             "timed_out",
             "duration_ms",
             "status",
+            *policy_keys,
         )
     else:
         return None

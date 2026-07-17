@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..types import AgentConfig
+from ..security.models import SECURITY_POLICY_VERSION
 from .codec import artifact_ref_to_dict
 from .models import ArtifactRef, JsonValue
 
@@ -53,6 +54,11 @@ class SessionPrivacyPolicy:
             "context_max_files": config.context_max_files,
             "context_max_bytes_per_file": config.context_max_bytes_per_file,
             "max_fix_attempts": config.max_fix_attempts,
+            "sandbox_mode": config.sandbox_mode,
+            "sandbox_image": _redact_text(config.sandbox_image, secrets),
+            "sandbox_image_digest": config.sandbox_image_digest,
+            "full_auto": config.full_auto,
+            "security_policy_version": SECURITY_POLICY_VERSION,
         }
 
     def sanitize_artifact_content(self, content: bytes) -> bytes:

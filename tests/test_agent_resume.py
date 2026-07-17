@@ -15,11 +15,13 @@ from coding_agent.agent import (
     ResumeModelContextUnavailable,
     ResumeTurnLimitError,
     SessionAlreadyCompletedError,
+    SessionSecurityDriftError,
     resume_agent_with_report,
     run_agent_with_report,
 )
 from coding_agent.approvals import ApprovalRequest, create_approval_decision
 from coding_agent.sessions.codec import session_started_from_dict
+from coding_agent.security.models import SandboxCapability, SecureExecutionResult
 from coding_agent.sessions.reducer import rebuild_state
 from coding_agent.sessions.store import (
     ConcurrentSessionWriteError,
@@ -43,6 +45,9 @@ def _config(
     max_fix_attempts: int = 2,
     auto_approve_edits: bool = False,
     auto_approve_commands: bool = False,
+    sandbox_mode: str = "none",
+    sandbox_image_digest: str | None = None,
+    full_auto: bool = False,
 ) -> AgentConfig:
     return AgentConfig(
         workspace=str(workspace),
@@ -55,6 +60,9 @@ def _config(
         context_max_files=6,
         context_max_bytes_per_file=4_000,
         max_fix_attempts=max_fix_attempts,
+        sandbox_mode=sandbox_mode,  # type: ignore[arg-type]
+        sandbox_image_digest=sandbox_image_digest,
+        full_auto=full_auto,
     )
 
 
@@ -141,6 +149,220 @@ class _NoModelCallsClient:
 
     def create_tool_response(self, **_kwargs: object) -> object:
         raise AssertionError("resume must not create a continuation response")
+
+
+def test_resume_rejects_pinned_docker_image_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_digest = "sha256:" + "a" * 64
+    changed_digest = "sha256:" + "b" * 64
+    (tmp_path / "value.txt").write_text("value\n", encoding="utf-8")
+    store = SessionStore(tmp_path)
+    client = _ToolThenFinalClient(
+        _function_call("call-read", "read_file", {"path": "value.txt"})
+    )
+    with pytest.raises(KeyboardInterrupt):
+        run_agent_with_report(
+            "read a file",
+            _config(
+                tmp_path,
+                sandbox_mode="docker",
+                sandbox_image_digest=original_digest,
+            ),
+            model_client=client,
+            session_store=store,
+            fault_injector=_interrupt_at("after_tool_side_effect"),
+        )
+
+    class DriftedBackend:
+        def __init__(self, image_reference: str) -> None:
+            self.image_reference = image_reference
+
+        def probe_capability(self, _workspace: Path) -> SandboxCapability:
+            return SandboxCapability(
+                backend="docker",
+                available=True,
+                reason=None,
+                image_reference=self.image_reference,
+                image_digest=changed_digest,
+            )
+
+    monkeypatch.setattr(agent_module, "DockerSandboxBackend", DriftedBackend)
+
+    with pytest.raises(SessionSecurityDriftError, match="digest changed"):
+        resume_agent_with_report(
+            _latest_session_id(store),
+            tmp_path,
+            model_client=_NoModelCallsClient(),
+            session_store=store,
+        )
+
+
+@pytest.mark.parametrize("cleanup_succeeded", [True, False])
+def test_full_auto_retries_only_after_interrupted_container_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_succeeded: bool,
+) -> None:
+    digest = "sha256:" + "c" * 64
+    executions = 0
+
+    def fake_execute(
+        config,
+        command,
+        decision,
+        *,
+        security_event_handler,
+        **_kwargs,
+    ) -> ToolResult:
+        nonlocal executions
+        executions += 1
+        capability = SandboxCapability(
+            backend="docker",
+            available=True,
+            reason=None,
+            image_reference=config.sandbox_image,
+            image_digest=digest,
+        )
+        security_event_handler(
+            "sandbox.capability_checked",
+            {"capability": capability.to_dict()},
+        )
+        security_event_handler(
+            "sandbox.snapshot_created",
+            {
+                "snapshot": {
+                    "schema_version": 1,
+                    "manifest_sha256": "d" * 64,
+                    "file_count": 1,
+                    "total_bytes": 5,
+                    "excluded_counts": {},
+                }
+            },
+        )
+        security_event_handler(
+            "sandbox.started",
+            {
+                "backend": "docker",
+                "container_name": "coding-agent-session-call",
+                "image_digest": digest,
+                "network_mode": "none",
+                "snapshot_scope": "temporary",
+            },
+        )
+        secure_result = SecureExecutionResult(
+            command=command,
+            decision=decision,
+            status="passed",
+            backend="docker",
+            sandboxed=True,
+            image_digest=digest,
+            exit_code=0,
+            timed_out=False,
+            duration_ms=1,
+            output="isolated\n",
+            output_truncated=False,
+            omitted_lines=0,
+            omitted_bytes=0,
+            error_reason=None,
+        )
+        security_event_handler(
+            "sandbox.finished",
+            {"result": secure_result.to_dict()},
+        )
+        return ToolResult(
+            ok=True,
+            output="isolated\n",
+            data={
+                "type": "secure_command_result",
+                "status": "passed",
+                "backend": "docker",
+                "sandboxed": True,
+                "image_digest": digest,
+            },
+        )
+
+    monkeypatch.setattr(tools_module, "_execute_docker_command", fake_execute)
+    store = SessionStore(tmp_path)
+    client = _ToolThenFinalClient(
+        _function_call(
+            "call-command",
+            "run_command",
+            {"argv": ["echo", "isolated"]},
+        )
+    )
+    config = _config(
+        tmp_path,
+        auto_approve_commands=True,
+        sandbox_mode="docker",
+        sandbox_image_digest=digest,
+        full_auto=True,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        run_agent_with_report(
+            "run isolated command",
+            config,
+            model_client=client,
+            session_store=store,
+            fault_injector=_interrupt_at("after_tool_side_effect"),
+        )
+
+    reconciled = []
+
+    class RecoveryBackend:
+        def __init__(self, image_reference: str) -> None:
+            self.image_reference = image_reference
+
+        def probe_capability(self, _workspace: Path) -> SandboxCapability:
+            return SandboxCapability(
+                backend="docker",
+                available=True,
+                reason=None,
+                image_reference=self.image_reference,
+                image_digest=digest,
+            )
+
+        def reconcile_interrupted_container(self, workspace, container_name):
+            reconciled.append((Path(workspace), container_name))
+            return (
+                True,
+                cleanup_succeeded,
+                None if cleanup_succeeded else "cleanup failed",
+            )
+
+    monkeypatch.setattr(agent_module, "DockerSandboxBackend", RecoveryBackend)
+
+    session_id = _latest_session_id(store)
+    if not cleanup_succeeded:
+        with pytest.raises(SessionSecurityDriftError, match="cleanup failed"):
+            resume_agent_with_report(
+                session_id,
+                tmp_path,
+                model_client=client,
+                session_store=store,
+            )
+        assert executions == 1
+        assert any(
+            event.type == "sandbox.cleanup_failed"
+            for event in store.load(session_id)
+        )
+        return
+
+    report = resume_agent_with_report(
+        session_id,
+        tmp_path,
+        model_client=client,
+        session_store=store,
+    )
+
+    assert report.answer == "done"
+    assert executions == 2
+    assert reconciled == [(tmp_path.resolve(), "coding-agent-session-call")]
+    events = store.load(report.session_id or "")
+    recovery = next(event for event in events if event.type == "tool.recovered")
+    assert recovery.payload["reason"] == "sandbox_reconciled"
+    assert recovery.payload["requires_reapproval"] is False
 
 
 def test_resume_retries_the_exact_persisted_initial_request(tmp_path: Path) -> None:
@@ -469,7 +691,16 @@ def test_process_recovery_uses_explicit_resume_approval(
 ) -> None:
     executions = 0
 
-    def fake_command(command: str, cwd: str, timeout_ms: int) -> ToolResult:
+    def fake_command(
+        argv: tuple[str, ...],
+        workspace: str | Path,
+        cwd: str,
+        timeout_ms: int,
+        *,
+        policy_decision: object,
+        approval_granted: bool,
+        command_spec: object,
+    ) -> ToolResult:
         nonlocal executions
         executions += 1
         return ToolResult(
@@ -477,9 +708,9 @@ def test_process_recovery_uses_explicit_resume_approval(
             output="exit code: 0",
             data={
                 "type": "command_result",
-                "command": command,
-                "cwd": str(Path(cwd).resolve()),
-                "shell": True,
+                "argv": list(argv),
+                "cwd": str((Path(workspace) / cwd).resolve()),
+                "shell": False,
                 "timeout_ms": timeout_ms,
                 "exit_code": 0,
                 "timed_out": False,
@@ -487,13 +718,13 @@ def test_process_recovery_uses_explicit_resume_approval(
             },
         )
 
-    monkeypatch.setattr(tools_module, "_run_shell_command", fake_command)
+    monkeypatch.setattr(tools_module, "_run_argv_command", fake_command)
     store = SessionStore(tmp_path)
     client = _ToolThenFinalClient(
         _function_call(
             "call-command",
             "run_command",
-            {"command": "echo recovery"},
+            {"argv": ["echo", "recovery"]},
         )
     )
     with pytest.raises(KeyboardInterrupt):

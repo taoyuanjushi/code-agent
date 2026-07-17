@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..path_safety import resolve_inside_workspace
+from ..path_safety import resolve_workspace_path
 from .models import AgentSessionState, SessionStarted
 from .recovery import FileHashObservation, ToolRecoveryPlan
 
@@ -94,7 +94,18 @@ def validate_workspace_guard(
             raise WorkspaceGuardError(
                 f"Persisted hash for {relative_path!r} is not a string or null."
             )
-        absolute = resolve_inside_workspace(actual, relative_path)
+        absolute = resolve_workspace_path(
+            actual,
+            relative_path,
+            operation="write",
+            allow_missing=True,
+        )
+        absolute = resolve_workspace_path(
+            actual,
+            relative_path,
+            operation="write",
+            allow_missing=True,
+        )
         current_hash = hash_file_or_none(absolute)
         if current_hash == expected_hash:
             continue
@@ -130,9 +141,16 @@ def discover_git_head(workspace: str | Path) -> str | None:
     if git is None:
         return None
     try:
+        root = Path(workspace).resolve(strict=True)
+        cwd = resolve_workspace_path(
+            root,
+            ".",
+            operation="execute",
+            allow_missing=False,
+        )
         completed = subprocess.run(
             [git, "rev-parse", "--verify", "HEAD"],
-            cwd=Path(workspace).resolve(),
+            cwd=cwd,
             text=True,
             capture_output=True,
             check=False,

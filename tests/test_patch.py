@@ -104,3 +104,55 @@ def test_plan_patch_rejects_paths_outside_workspace(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Path escapes workspace"):
         plan_patch(tmp_path, patch)
+
+
+def test_patch_plan_rejects_internal_symlink_write_target(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("before\n", encoding="utf-8")
+    link = tmp_path / "linked.txt"
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable on this platform: {exc}")
+
+    patch = "\n".join(
+        [
+            "--- a/linked.txt",
+            "+++ b/linked.txt",
+            "@@ -1 +1 @@",
+            "-before",
+            "+after",
+            "",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="symlink or reparse"):
+        plan_patch(tmp_path, patch)
+    assert target.read_text(encoding="utf-8") == "before\n"
+
+
+def test_apply_patch_plan_revalidates_parent_after_planning(tmp_path: Path) -> None:
+    source_directory = tmp_path / "src"
+    source_directory.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    patch = "\n".join(
+        [
+            "--- /dev/null",
+            "+++ b/src/created.txt",
+            "@@ -0,0 +1 @@",
+            "+safe",
+            "",
+        ]
+    )
+    patch_plan = plan_patch(tmp_path, patch)
+
+    source_directory.rmdir()
+    try:
+        source_directory.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable on this platform: {exc}")
+
+    with pytest.raises(ValueError, match="symlink or reparse"):
+        apply_patch_plan(patch_plan)
+    assert not (outside / "created.txt").exists()

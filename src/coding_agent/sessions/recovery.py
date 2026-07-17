@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from ..approvals import ApprovalRequest
-from ..path_safety import resolve_inside_workspace
+from ..path_safety import resolve_workspace_path
 from ..tool_outputs import build_persistable_tool_output, thaw_json
 from ..tool_policy import ToolEffect, hash_tool_arguments
 from ..tools import VerificationToolState
@@ -409,7 +409,12 @@ def _observe_file_hash(
     path = _required_string(item.get("path"), "file change path")
     before = _optional_sha256(item.get("before_sha256"), "before_sha256")
     after = _optional_sha256(item.get("after_sha256"), "after_sha256")
-    absolute = resolve_inside_workspace(workspace, path)
+    absolute = resolve_workspace_path(
+        workspace,
+        path,
+        operation="write",
+        allow_missing=True,
+    )
     current = _hash_file_or_none(absolute)
     if current == after:
         match: FileHashMatch = "after"

@@ -12,7 +12,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
 
-from ..path_safety import resolve_inside_workspace
+from ..path_safety import (
+    ensure_workspace_parent_directory,
+    resolve_workspace_path,
+)
 from .codec import (
     SessionCodecError,
     artifact_ref_to_dict,
@@ -89,11 +92,12 @@ class SessionStore:
         privacy_policy: SessionPrivacyPolicy | None = None,
         read_only: bool = False,
     ) -> None:
-        workspace_path = Path(workspace).resolve()
-        if not workspace_path.is_dir():
-            raise ValueError(
-                f"Workspace is not an existing directory: {workspace_path}"
-            )
+        workspace_path = resolve_workspace_path(
+            workspace,
+            ".",
+            operation="write",
+            allow_missing=False,
+        )
 
         if privacy_policy is not None and not isinstance(
             privacy_policy, SessionPrivacyPolicy
@@ -106,18 +110,21 @@ class SessionStore:
         self.privacy_policy = privacy_policy or SessionPrivacyPolicy()
         self.read_only = read_only
         self._exclusive_writer_owners: dict[str, int] = {}
-        self.root = resolve_inside_workspace(workspace_path, ".coding-agent")
-        self.sessions_dir = resolve_inside_workspace(self.root, "sessions")
-        self.artifacts_dir = resolve_inside_workspace(self.root, "artifacts")
-        self.locks_dir = resolve_inside_workspace(self.root, "locks")
+        self.root = self._resolve_store_path(".", allow_missing=True)
+        self.sessions_dir = self._resolve_store_path("sessions", allow_missing=True)
+        self.artifacts_dir = self._resolve_store_path("artifacts", allow_missing=True)
+        self.locks_dir = self._resolve_store_path("locks", allow_missing=True)
         if not self.read_only:
-            for directory in (
-                self.root,
-                self.sessions_dir,
-                self.artifacts_dir,
-                self.locks_dir,
-            ):
-                directory.mkdir(parents=True, exist_ok=True)
+            for relative_directory in (".", "sessions", "artifacts", "locks"):
+                directory = self._resolve_store_path(
+                    relative_directory,
+                    allow_missing=True,
+                )
+                directory.mkdir(exist_ok=True)
+                self._resolve_store_path(
+                    relative_directory,
+                    allow_missing=False,
+                )
 
     def create(self, started_payload: Mapping[str, object]) -> str:
         """Create a new durable session containing one ``session.started`` event."""
@@ -334,7 +341,10 @@ class SessionStore:
         _validate_session_id(session_id)
         self._require_writable("acquire a session writer lock")
         lock_path = self._lock_path(session_id)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_workspace_parent_directory(
+            self.workspace,
+            lock_path.relative_to(self.workspace),
+        )
 
         with _PROCESS_LOCK_GUARD:
             if lock_path in _PROCESS_LOCKS:
@@ -346,6 +356,10 @@ class SessionStore:
         stream: BinaryIO | None = None
         locked = False
         try:
+            lock_path = self._revalidate_store_path(
+                lock_path,
+                allow_missing=True,
+            )
             stream = lock_path.open("a+b")
             stream.seek(0, os.SEEK_END)
             if stream.tell() == 0:
@@ -380,6 +394,10 @@ class SessionStore:
         if not event_path.is_file():
             raise SessionNotFoundError(f"Session {session_id} was not found.")
 
+        event_path = self._revalidate_store_path(
+            event_path,
+            allow_missing=False,
+        )
         raw = event_path.read_bytes()
         if not raw:
             raise SessionCodecError("session log is empty", source=str(event_path))
@@ -506,11 +524,25 @@ class SessionStore:
             media_type=media_type,
             encoding=encoding,
         )
-        session_dir = resolve_inside_workspace(self.artifacts_dir, session_id)
-        session_dir.mkdir(parents=True, exist_ok=True)
-        destination = resolve_inside_workspace(session_dir, f"{digest}.blob")
+        session_dir = self._resolve_store_path(
+            f"artifacts/{session_id}",
+            allow_missing=True,
+        )
+        session_dir.mkdir(exist_ok=True)
+        session_dir = self._revalidate_store_path(
+            session_dir,
+            allow_missing=False,
+        )
+        destination = self._resolve_store_path(
+            f"artifacts/{session_id}/{digest}.blob",
+            allow_missing=True,
+        )
 
         if destination.exists():
+            destination = self._revalidate_store_path(
+                destination,
+                allow_missing=False,
+            )
             existing = destination.read_bytes()
             try:
                 self._verify_artifact_bytes(existing, ref, label="existing artifact")
@@ -522,16 +554,39 @@ class SessionStore:
 
         temporary = self._unique_artifact_temp_path(session_dir, digest)
         try:
+            temporary = self._revalidate_store_path(
+                temporary,
+                allow_missing=True,
+            )
             with temporary.open("xb", buffering=0) as stream:
                 _write_all(stream, content)
                 stream.flush()
                 os.fsync(stream.fileno())
+            temporary = self._revalidate_store_path(
+                temporary,
+                allow_missing=False,
+            )
+            destination = self._revalidate_store_path(
+                destination,
+                allow_missing=True,
+            )
             os.replace(temporary, destination)
+            session_dir = self._revalidate_store_path(
+                session_dir,
+                allow_missing=False,
+            )
             _fsync_directory(session_dir)
         finally:
-            with suppress(FileNotFoundError):
-                temporary.unlink()
+            with suppress(FileNotFoundError, OSError, ValueError):
+                self._revalidate_store_path(
+                    temporary,
+                    allow_missing=True,
+                ).unlink()
 
+        destination = self._revalidate_store_path(
+            destination,
+            allow_missing=False,
+        )
         stored = destination.read_bytes()
         self._verify_artifact_bytes(stored, ref, label="stored artifact")
         return ref
@@ -539,7 +594,10 @@ class SessionStore:
     def _unique_artifact_temp_path(self, session_dir: Path, digest: str) -> Path:
         for _ in range(_SESSION_ID_ATTEMPTS):
             name = f".{digest}.{secrets.token_hex(8)}.tmp"
-            candidate = resolve_inside_workspace(session_dir, name)
+            candidate = self._revalidate_store_path(
+                session_dir / name,
+                allow_missing=True,
+            )
             if not candidate.exists():
                 return candidate
         raise SessionStoreError("Could not allocate an artifact temporary file.")
@@ -551,6 +609,10 @@ class SessionStore:
         resumed: SessionEvent,
     ) -> None:
         record = encode_event(resumed) + b"\n"
+        event_path = self._revalidate_store_path(
+            event_path,
+            allow_missing=False,
+        )
         with event_path.open("r+b", buffering=0) as stream:
             stream.truncate(len(complete_bytes))
             stream.seek(0, os.SEEK_END)
@@ -581,6 +643,7 @@ class SessionStore:
         record = encode_event(event) + b"\n"
         created = False
         try:
+            path = self._revalidate_store_path(path, allow_missing=True)
             with path.open("xb", buffering=0) as stream:
                 created = True
                 _write_all(stream, record)
@@ -588,12 +651,16 @@ class SessionStore:
                 os.fsync(stream.fileno())
         except BaseException:
             if created:
-                with suppress(OSError):
-                    path.unlink()
+                with suppress(OSError, ValueError):
+                    self._revalidate_store_path(
+                        path,
+                        allow_missing=True,
+                    ).unlink()
             raise
 
     def _append_event_unlocked(self, path: Path, event: SessionEvent) -> None:
         record = encode_event(event) + b"\n"
+        path = self._revalidate_store_path(path, allow_missing=False)
         with path.open("ab", buffering=0) as stream:
             _write_all(stream, record)
             stream.flush()
@@ -604,11 +671,22 @@ class SessionStore:
         session_id: str,
         ref: ArtifactRef,
     ) -> bytes:
-        artifact_path = resolve_inside_workspace(self.artifacts_dir, ref.path)
+        artifact_path = self._resolve_store_path(
+            f"artifacts/{ref.path}",
+            allow_missing=True,
+        )
+        artifact_path = self._revalidate_store_path(
+            artifact_path,
+            allow_missing=True,
+        )
         if not artifact_path.is_file():
             raise ArtifactNotFoundError(
                 f"Artifact {ref.sha256} was not found for session {session_id}."
             )
+        artifact_path = self._revalidate_store_path(
+            artifact_path,
+            allow_missing=False,
+        )
         content = artifact_path.read_bytes()
         self._verify_artifact_bytes(content, ref, label="artifact")
         return content
@@ -638,16 +716,63 @@ class SessionStore:
             )
 
     def _require_session_exists(self, session_id: str) -> None:
-        if not self._session_path(session_id).is_file():
+        session_path = self._revalidate_store_path(
+            self._session_path(session_id),
+            allow_missing=True,
+        )
+        if not session_path.is_file():
             raise SessionNotFoundError(f"Session {session_id} was not found.")
 
     def _session_path(self, session_id: str) -> Path:
         _validate_session_id(session_id)
-        return resolve_inside_workspace(self.sessions_dir, f"{session_id}.jsonl")
+        return self._resolve_store_path(
+            f"sessions/{session_id}.jsonl",
+            allow_missing=True,
+        )
 
     def _lock_path(self, session_id: str) -> Path:
         _validate_session_id(session_id)
-        return resolve_inside_workspace(self.locks_dir, f"{session_id}.lock")
+        return self._resolve_store_path(
+            f"locks/{session_id}.lock",
+            allow_missing=True,
+        )
+
+    def _resolve_store_path(
+        self,
+        relative_path: str,
+        *,
+        allow_missing: bool,
+    ) -> Path:
+        requested = (
+            ".coding-agent"
+            if relative_path == "."
+            else f".coding-agent/{relative_path}"
+        )
+        return resolve_workspace_path(
+            self.workspace,
+            requested,
+            operation="write",
+            allow_missing=allow_missing,
+        )
+
+    def _revalidate_store_path(
+        self,
+        path: Path,
+        *,
+        allow_missing: bool,
+    ) -> Path:
+        try:
+            relative = path.relative_to(self.workspace)
+        except ValueError as exc:
+            raise SessionStoreError(
+                f"Session path escapes workspace: {path}"
+            ) from exc
+        return resolve_workspace_path(
+            self.workspace,
+            relative,
+            operation="write",
+            allow_missing=allow_missing,
+        )
 
 
 def _validate_session_id(session_id: object) -> None:

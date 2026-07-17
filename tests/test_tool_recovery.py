@@ -330,7 +330,16 @@ def test_process_recovery_ignores_auto_approval_and_requires_resume_source(
 ) -> None:
     executions = 0
 
-    def fake_command(command: str, cwd: str, timeout_ms: int) -> ToolResult:
+    def fake_command(
+        argv: tuple[str, ...],
+        workspace: str | Path,
+        cwd: str,
+        timeout_ms: int,
+        *,
+        policy_decision: object,
+        approval_granted: bool,
+        command_spec: object,
+    ) -> ToolResult:
         nonlocal executions
         executions += 1
         return ToolResult(
@@ -338,9 +347,9 @@ def test_process_recovery_ignores_auto_approval_and_requires_resume_source(
             output="exit code: 0",
             data={
                 "type": "command_result",
-                "command": command,
-                "cwd": str(Path(cwd).resolve()),
-                "shell": True,
+                "argv": list(argv),
+                "cwd": str((Path(workspace) / cwd).resolve()),
+                "shell": False,
                 "timeout_ms": timeout_ms,
                 "exit_code": 0,
                 "timed_out": False,
@@ -348,11 +357,11 @@ def test_process_recovery_ignores_auto_approval_and_requires_resume_source(
             },
         )
 
-    monkeypatch.setattr(tools_module, "_run_shell_command", fake_command)
+    monkeypatch.setattr(tools_module, "_run_argv_command", fake_command)
     store, session_id = _interrupted_session(
         tmp_path,
         name="run_command",
-        arguments={"command": "echo recovery"},
+        arguments={"argv": ["echo", "recovery"]},
         config=_config(tmp_path, auto_approve_commands=True),
     )
     events = store.load(session_id)
@@ -398,7 +407,7 @@ def test_process_recovery_ignores_auto_approval_and_requires_resume_source(
         "tool.recovered",
         build_recovery_event_payload(plan),
     )
-    raw_arguments = json.dumps({"command": "echo recovery"})
+    raw_arguments = json.dumps({"argv": ["echo", "recovery"]})
     store.append(
         session_id,
         "tool.started",

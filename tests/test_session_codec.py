@@ -97,7 +97,15 @@ def test_session_domain_models_have_explicit_round_trip_codecs(tmp_path: Path) -
     started = SessionStarted(
         task="修复 Unicode 行为",
         workspace=workspace,
-        config={"workspace": workspace, "model": "gpt-test", "max_turns": 8},
+        config={
+            "workspace": workspace,
+            "model": "gpt-test",
+            "max_turns": 8,
+            "sandbox_mode": "docker",
+            "sandbox_image": "python:3.12-slim",
+            "sandbox_image_digest": f"sha256:{SHA_A}",
+            "full_auto": True,
+        },
         git_head="abc123",
         workspace_guard=guard,
     )

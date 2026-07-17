@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.process_fakes import patch_verification_runner
+
 import coding_agent.verification as verification
 from coding_agent.verification import (
     VerificationDiscoveryResult,
@@ -112,9 +114,8 @@ def test_runner_uses_unified_discovery_when_result_is_not_supplied(
         return discovery
 
     monkeypatch.setattr(verification, "discover_verification_commands", fake_discover)
-    monkeypatch.setattr(
-        verification.subprocess,
-        "run",
+    patch_verification_runner(
+        monkeypatch,
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
             stdout="ok",
@@ -159,7 +160,7 @@ def test_runner_executes_only_discovered_argv_without_shell(
             stderr="warning\n",
         )
 
-    monkeypatch.setattr(verification.subprocess, "run", fake_run)
+    patch_verification_runner(monkeypatch, fake_run)
 
     result = run_verification_command(
         tmp_path,
@@ -192,9 +193,8 @@ def test_runner_reports_failed_exit_code(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        verification.subprocess,
-        "run",
+    patch_verification_runner(
+        monkeypatch,
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=2,
             stdout="",
@@ -226,9 +226,8 @@ def test_runner_prioritizes_failure_context_and_stderr_tail(
             *(f"cleanup {index}" for index in range(30)),
         ]
     )
-    monkeypatch.setattr(
-        verification.subprocess,
-        "run",
+    patch_verification_runner(
+        monkeypatch,
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=1,
             stdout=stdout,
@@ -256,9 +255,8 @@ def test_runner_keeps_passed_output_brief(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        verification.subprocess,
-        "run",
+    patch_verification_runner(
+        monkeypatch,
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
             stdout="\n".join(f"passed detail {index}" for index in range(100)),
@@ -289,7 +287,7 @@ def test_runner_rejects_unknown_command_id_without_starting_process(
     def fail_run(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("subprocess must not run")
 
-    monkeypatch.setattr(verification.subprocess, "run", fail_run)
+    patch_verification_runner(monkeypatch, fail_run)
 
     with pytest.raises(ValueError, match="Unknown verification command id"):
         run_verification_command(
@@ -306,7 +304,7 @@ def test_runner_does_not_start_unavailable_command(
     def fail_run(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("subprocess must not run")
 
-    monkeypatch.setattr(verification.subprocess, "run", fail_run)
+    patch_verification_runner(monkeypatch, fail_run)
 
     result = run_verification_command(
         tmp_path,
@@ -325,9 +323,8 @@ def test_runner_handles_runtime_not_found_and_startup_error(
 ) -> None:
     discovery = _discovery(tmp_path)
 
-    monkeypatch.setattr(
-        verification.subprocess,
-        "run",
+    patch_verification_runner(
+        monkeypatch,
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             FileNotFoundError("missing runtime")
         ),
@@ -338,9 +335,8 @@ def test_runner_handles_runtime_not_found_and_startup_error(
         discovery=discovery,
     )
 
-    monkeypatch.setattr(
-        verification.subprocess,
-        "run",
+    patch_verification_runner(
+        monkeypatch,
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             OSError("cannot start")
         ),
@@ -369,7 +365,7 @@ def test_runner_handles_timeout_and_limits_partial_output(
             stderr="error tail",
         )
 
-    monkeypatch.setattr(verification.subprocess, "run", time_out)
+    patch_verification_runner(monkeypatch, time_out)
 
     result = run_verification_command(
         tmp_path,
@@ -395,7 +391,7 @@ def test_runner_declined_approval_does_not_start_process(
     def fail_run(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("subprocess must not run")
 
-    monkeypatch.setattr(verification.subprocess, "run", fail_run)
+    patch_verification_runner(monkeypatch, fail_run)
 
     result = run_verification_command(
         tmp_path,
@@ -460,9 +456,8 @@ def test_runner_preserves_unicode_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        verification.subprocess,
-        "run",
+    patch_verification_runner(
+        monkeypatch,
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=1,
             stdout="???????????? ?\n",

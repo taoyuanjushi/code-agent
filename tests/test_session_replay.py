@@ -109,6 +109,57 @@ def test_read_only_store_never_creates_or_modifies_session_files(
     assert _snapshot_files(workspace) == before
 
 
+def test_replay_renders_security_events_without_probing_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path)
+    session_id = store.create(
+        {"task": "replay security", "workspace": str(tmp_path.resolve())}
+    )
+    store.append(
+        session_id,
+        "security.policy_evaluated",
+        {
+            "call_id": "call-1",
+            "policy": {
+                "rule_id": "sandbox.unknown",
+                "disposition": "sandbox_required",
+            },
+        },
+    )
+    store.append(
+        session_id,
+        "sandbox.capability_checked",
+        {
+            "call_id": "call-1",
+            "capability": {
+                "available": True,
+                "image_digest": "sha256:" + "a" * 64,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("replay must not run subprocesses"),
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "DockerSandboxBackend",
+        lambda *_args, **_kwargs: pytest.fail("replay must not probe Docker"),
+    )
+
+    replay = build_session_replay_payload(
+        SessionStore(tmp_path, read_only=True),
+        session_id,
+    )
+
+    summaries = [item["summary"] for item in replay["timeline"]]
+    assert "policy sandbox.unknown -> sandbox_required" in summaries
+    assert "sandbox capability -> available" in summaries
+
+
 def test_replay_builds_auditable_summary_without_exposing_payloads(
     tmp_path: Path,
 ) -> None:

@@ -272,3 +272,27 @@ def test_system_prompt_defines_evidence_driven_verification_workflow(
     assert "never guess a command or arbitrary argv" in prompt
     assert "any skipped checks and the reason they were skipped" in prompt
     assert "run a broader relevant check when one is available" in prompt
+
+
+def test_system_prompt_forbids_command_policy_evasion(tmp_path: Path) -> None:
+    config = AgentConfig(
+        workspace=str(tmp_path),
+        model="fake-model",
+        reasoning_effort="medium",
+        max_turns=4,
+        permission_mode="workspace-write",
+        auto_approve_commands=False,
+        auto_approve_edits=False,
+        context_max_files=6,
+        context_max_bytes_per_file=8_000,
+        sandbox_mode="docker",
+    )
+
+    prompt = build_system_prompt(config)
+
+    assert "Sandbox mode: docker" in prompt
+    assert "dependency installation, network access" in prompt
+    assert "secret/environment credential access" in prompt
+    assert "Never use run_command to bypass" in prompt
+    assert "Never rewrite, split, wrap, or otherwise disguise" in prompt
+    assert "secure_command_result" in prompt

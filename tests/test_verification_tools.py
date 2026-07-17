@@ -7,7 +7,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.process_fakes import patch_verification_runner
+
 import coding_agent.verification as verification
+import coding_agent.tools as tools_module
+from coding_agent.security.models import SandboxCapability, SecureExecutionResult
+from coding_agent.security.sandbox import SandboxExecutionOutcome
 from coding_agent.tools import (
     TOOL_DEFINITIONS,
     VerificationToolState,
@@ -18,8 +23,10 @@ from coding_agent.verification import (
     MAX_VERIFICATION_OUTPUT_BYTES,
     MAX_VERIFICATION_OUTPUT_LINES,
     MAX_VERIFICATION_TIMEOUT_MS,
+    VerificationDiscoveryResult,
     VerificationResult,
     VerificationStatus,
+    create_verification_command,
 )
 
 
@@ -27,6 +34,8 @@ def _config(
     tmp_path: Path,
     *,
     max_fix_attempts: int = 3,
+    sandbox_mode: str = "none",
+    sandbox_image_digest: str | None = None,
 ) -> AgentConfig:
     return AgentConfig(
         workspace=str(tmp_path),
@@ -39,6 +48,8 @@ def _config(
         context_max_files=6,
         context_max_bytes_per_file=8_000,
         max_fix_attempts=max_fix_attempts,
+        sandbox_mode=sandbox_mode,  # type: ignore[arg-type]
+        sandbox_image_digest=sandbox_image_digest,
     )
 
 
@@ -111,9 +122,8 @@ def test_run_verification_tool_records_failed_structured_result(
 ) -> None:
     _python_project(tmp_path)
     monkeypatch.setattr(verification, "_python_module_available", lambda _name: True)
-    monkeypatch.setattr(
-        verification.subprocess,
-        "run",
+    patch_verification_runner(
+        monkeypatch,
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=1,
             stdout="progress\nERROR src/refund.py:17 expected 20\n",
@@ -137,7 +147,7 @@ def test_run_verification_tool_records_failed_structured_result(
 
     assert result.ok is False
     assert result.data is not None
-    assert result.data["type"] == "verification_result"
+    assert result.data["type"] == "secure_command_result"
     assert result.data["status"] == "failed"
     assert result.data["exit_code"] == 1
     assert result.data["attempt"] == 1
@@ -157,7 +167,7 @@ def test_run_verification_rejects_injected_argv_and_unknown_ids(
     def fail_run(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("subprocess must not run")
 
-    monkeypatch.setattr(verification.subprocess, "run", fail_run)
+    patch_verification_runner(monkeypatch, fail_run)
     state = VerificationToolState(task="test", max_fix_attempts=3)
 
     injected = execute_tool(
@@ -184,6 +194,195 @@ def test_run_verification_rejects_injected_argv_and_unknown_ids(
     assert "Unknown verification command id" in unknown.output
 
 
+def test_inline_verification_is_blocked_before_approval_and_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = create_verification_command(
+        workspace=tmp_path,
+        command_id="python:inline",
+        kind="test",
+        argv=(sys.executable, "-c", "print('unsafe')"),
+        source="fixture",
+        available=True,
+    )
+    state = VerificationToolState(task="test", max_fix_attempts=3)
+    state.discovery = VerificationDiscoveryResult(
+        workspace=str(tmp_path.resolve()),
+        commands=(command,),
+    )
+    approval_calls = 0
+    subprocess_calls = 0
+
+    def forbidden_approval(_request: object):
+        nonlocal approval_calls
+        approval_calls += 1
+        raise AssertionError("sandbox-required verification must not request approval")
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        nonlocal subprocess_calls
+        subprocess_calls += 1
+        raise AssertionError("sandbox-required verification must not start subprocesses")
+
+    patch_verification_runner(monkeypatch, forbidden_run)
+
+    result = execute_tool(
+        _config(tmp_path),
+        "run_verification",
+        json.dumps({"command_id": "python:inline"}),
+        state=state,
+        approval_handler=forbidden_approval,
+    )
+
+    assert result.ok is False
+    assert approval_calls == 0
+    assert subprocess_calls == 0
+    assert result.data is not None
+    assert result.data["type"] == "secure_command_result"
+    assert result.data["status"] == "sandbox_unavailable"
+    assert result.data["exit_code"] is None
+    assert result.data["disposition"] == "sandbox_required"
+    assert result.data["rule_id"] == "sandbox.inline_interpreter"
+    assert result.data["requires_approval"] is False
+    assert result.data["requires_sandbox"] is True
+    assert result.data["policy"]["rule_id"] == "sandbox.inline_interpreter"
+    assert "[sandbox.inline_interpreter]" in result.output
+
+
+def test_sandbox_required_verification_routes_to_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "sha256:" + "a" * 64
+    command = create_verification_command(
+        workspace=tmp_path,
+        command_id="python:inline",
+        kind="test",
+        argv=(sys.executable, "-c", "print('sandboxed')"),
+        source="fixture",
+        available=True,
+    )
+
+
+def _docker_outcome(config, command_spec, decision, digest: str):
+    capability = SandboxCapability(
+        backend="docker",
+        available=True,
+        reason=None,
+        image_reference=config.sandbox_image,
+        image_digest=digest,
+    )
+    return SandboxExecutionOutcome(
+        result=SecureExecutionResult(
+            command=command_spec,
+            decision=decision,
+            status="passed",
+            backend="docker",
+            sandboxed=True,
+            image_digest=digest,
+            exit_code=0,
+            timed_out=False,
+            duration_ms=12,
+            output="sandboxed\n",
+            output_truncated=False,
+            omitted_lines=0,
+            omitted_bytes=0,
+            error_reason=None,
+        ),
+        capability=capability,
+        snapshot_cleanup_succeeded=True,
+    )
+    state = VerificationToolState(task="test", max_fix_attempts=3)
+    state.discovery = VerificationDiscoveryResult(
+        workspace=str(tmp_path.resolve()),
+        commands=(command,),
+    )
+    executions = []
+
+    def fake_execute(
+        config,
+        command_spec,
+        decision,
+        **kwargs,
+    ) -> SandboxExecutionOutcome:
+        executions.append((config, command_spec, decision, kwargs))
+        return _docker_outcome(config, command_spec, decision, digest)
+
+    monkeypatch.setattr(tools_module, "_execute_docker_command", fake_execute)
+    patch_verification_runner(
+        monkeypatch,
+        lambda *_args, **_kwargs: pytest.fail("host execution must not run"),
+    )
+
+    result = execute_tool(
+        _config(
+            tmp_path,
+            sandbox_mode="docker",
+            sandbox_image_digest=digest,
+        ),
+        "run_verification",
+        json.dumps({"command_id": "python:inline"}),
+        state=state,
+        session_id="session-1",
+        call_id="call-1",
+    )
+
+    assert len(executions) == 1
+    assert result.ok is True
+    assert result.data is not None
+    assert result.data["type"] == "secure_command_result"
+    assert result.data["status"] == "passed"
+    assert result.data["verification_status"] == "passed"
+    assert result.data["backend"] == "docker"
+    assert result.data["sandboxed"] is True
+    assert result.data["image_digest"] == digest
+    assert result.data["network_mode"] == "none"
+
+
+def test_explicit_docker_routes_allow_host_verification_to_stricter_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "sha256:" + "b" * 64
+    _python_project(tmp_path)
+    monkeypatch.setattr(verification, "_python_module_available", lambda _name: True)
+    state = VerificationToolState(task="test", max_fix_attempts=3)
+    execute_tool(
+        _config(tmp_path),
+        "discover_verification_commands",
+        "{}",
+        state=state,
+    )
+    executions = []
+
+    def fake_execute(config, command_spec, decision, **kwargs):
+        executions.append((decision, kwargs))
+        return _docker_outcome(config, command_spec, decision, digest)
+
+    monkeypatch.setattr(tools_module, "_execute_docker_command", fake_execute)
+    patch_verification_runner(
+        monkeypatch,
+        lambda *_args, **_kwargs: pytest.fail("host execution must not run"),
+    )
+
+    result = execute_tool(
+        _config(
+            tmp_path,
+            sandbox_mode="docker",
+            sandbox_image_digest=digest,
+        ),
+        "run_verification",
+        json.dumps({"command_id": "python:pytest"}),
+        state=state,
+    )
+
+    assert executions[0][0].disposition == "allow_host"
+    assert result.ok is True
+    assert result.data is not None
+    assert result.data["backend"] == "docker"
+    assert result.data["sandboxed"] is True
+
+
 def test_successful_verification_is_not_repeated_without_an_edit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -197,7 +396,7 @@ def test_successful_verification_is_not_repeated_without_an_edit(
         calls += 1
         return SimpleNamespace(returncode=0, stdout="1 passed\n", stderr="")
 
-    monkeypatch.setattr(verification.subprocess, "run", pass_run)
+    patch_verification_runner(monkeypatch, pass_run)
     state = VerificationToolState(task="test", max_fix_attempts=3)
 
     first = execute_tool(
@@ -369,9 +568,8 @@ def test_repair_loop_counts_patches_and_stops_after_the_limit(
     target = tmp_path / "value.py"
     target.write_text("VALUE = 0\n", encoding="utf-8")
     monkeypatch.setattr(verification, "_python_module_available", lambda _name: True)
-    monkeypatch.setattr(
-        verification.subprocess,
-        "run",
+    patch_verification_runner(
+        monkeypatch,
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=1,
             stdout="tests/test_value.py:4: AssertionError\n",

@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+from tests.process_fakes import patch_verification_runner
+
 import coding_agent.verification as verification
 from coding_agent.agent import (
     _verification_failure_note,
@@ -152,7 +154,7 @@ def test_agent_records_failed_then_passed_verification_loop(
             ),
         )
 
-    monkeypatch.setattr(verification.subprocess, "run", fake_run)
+    patch_verification_runner(monkeypatch, fake_run)
     config = AgentConfig(
         workspace=str(tmp_path),
         model="fake-model",

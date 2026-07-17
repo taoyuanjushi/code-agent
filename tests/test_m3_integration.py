@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from tests.process_fakes import patch_verification_runner
+
 import coding_agent.verification as verification
 from coding_agent.agent import run_agent_with_report
 from coding_agent.types import AgentConfig
@@ -189,7 +191,7 @@ def test_medium_repository_repairs_the_file_named_by_failure_output(
             ),
         )
 
-    monkeypatch.setattr(verification.subprocess, "run", fake_run)
+    patch_verification_runner(monkeypatch, fake_run)
     config = AgentConfig(
         workspace=str(tmp_path),
         model="fake-model",
