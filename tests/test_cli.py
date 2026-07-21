@@ -13,6 +13,7 @@ def test_build_parser_accepts_python_main_options() -> None:
             "medium",
             "--max-fix-attempts",
             "4",
+            "--no-stream",
             "fix tests",
         ]
     )
@@ -22,6 +23,7 @@ def test_build_parser_accepts_python_main_options() -> None:
     assert args.auto_approve_commands is True
     assert args.reasoning_effort == "medium"
     assert args.max_fix_attempts == "4"
+    assert args.no_stream is True
     assert args.task == ["fix tests"]
 
 

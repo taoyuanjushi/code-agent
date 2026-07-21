@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from .approvals import (
     ApprovalDecision,
     ApprovalHandler,
+    ApprovalInputReader,
     ApprovalRequest,
     ApprovalSource,
     build_default_approval_handler,
     build_resume_recovery_approval_handler,
     create_approval_decision,
+    render_approval_request,
     validate_approval_decision,
     validate_resume_recovery_decision,
 )
@@ -23,6 +26,14 @@ from .context import (
     collect_workspace_snapshot,
     format_snapshot,
 )
+from .explanations import (
+    ExplanationReadEvidence,
+    explanation_read_evidence_from_tool_data,
+    explanation_read_evidence_list_from_dict,
+    explanation_read_evidence_list_to_dict,
+    merge_explanation_read_evidence,
+    validate_explanation_answer,
+)
 from .instructions import discover_agent_instructions
 from .model_client import (
     ModelClient,
@@ -30,6 +41,11 @@ from .model_client import (
     normalize_model_response,
 )
 from .prompts import build_system_prompt, build_user_prompt
+from .reviews import (
+    ReviewResult,
+    review_result_from_dict,
+    review_result_to_dict,
+)
 from .security.docker_backend import DockerSandboxBackend
 from .security.models import SECURITY_POLICY_VERSION
 from .sessions.codec import (
@@ -41,6 +57,8 @@ from .sessions.codec import (
     normalized_model_response_from_dict,
     normalized_model_response_to_dict,
     pending_tool_call_to_dict,
+    plan_state_from_dict,
+    plan_state_to_dict,
     session_started_from_dict,
     session_started_to_dict,
     verification_result_to_dict,
@@ -70,6 +88,11 @@ from .sessions.workspace_guard import (
     discover_git_head,
     validate_workspace_guard,
 )
+from .task_modes import (
+    TASK_MODES,
+    TaskMode,
+    validate_task_mode_configuration,
+)
 from .tool_outputs import (
     build_persistable_tool_output,
     pending_outputs_for_model,
@@ -81,6 +104,7 @@ from .tool_policy import (
 )
 from .tools import VerificationToolState, execute_tool
 from .types import AgentConfig, ToolResult, WorkspaceSnapshot
+from .ui import UiEmitter, truncate_for_console
 from .verification import VerificationResult
 
 
@@ -90,6 +114,17 @@ class AgentRunReport:
     verifications: tuple[VerificationResult, ...]
     final_status: Literal["passed", "failed", "not_run"]
     session_id: str | None = None
+    review: ReviewResult | None = None
+
+
+@dataclass
+class _ToolSecurityUiState:
+    backend: str | None = None
+    sandboxed: bool | None = None
+    capability_status: str | None = None
+    image_digest_status: str | None = None
+    cleanup_failures: set[str] = field(default_factory=set)
+    sensitive_identifiers: set[str] = field(default_factory=set)
 
 
 FaultPoint = Literal[
@@ -125,6 +160,7 @@ class _SessionJournal:
 def _build_audited_approval_handler(
     journal: _SessionJournal,
     handler: ApprovalHandler,
+    ui_emitter: UiEmitter,
     *,
     validator: Callable[[ApprovalRequest, ApprovalDecision], None] = (
         validate_approval_decision
@@ -132,8 +168,16 @@ def _build_audited_approval_handler(
     failure_source: ApprovalSource | None = None,
 ) -> ApprovalHandler:
     def audited(request: ApprovalRequest) -> ApprovalDecision:
+        request_event = ui_emitter.emit(
+            "approval.requested",
+            _approval_request_ui_payload(request),
+        )
         decision: ApprovalDecision | None = None
         try:
+            if not isinstance(request_event.payload.get("message"), str):
+                raise ValueError(
+                    "Approval request is too large to display safely."
+                )
             decision = handler(request)
             validator(request, decision)
         except BaseException as exc:
@@ -159,6 +203,10 @@ def _build_audited_approval_handler(
                     "handler_error": exc,
                 },
             )
+            ui_emitter.emit(
+                "approval.decided",
+                _approval_decision_ui_payload(denied),
+            )
             raise
 
         journal.append(
@@ -168,9 +216,41 @@ def _build_audited_approval_handler(
                 "decision": approval_decision_to_dict(decision),
             },
         )
+        ui_emitter.emit(
+            "approval.decided",
+            _approval_decision_ui_payload(decision),
+        )
         return decision
 
     return audited
+
+
+def _approval_request_ui_payload(
+    request: ApprovalRequest,
+) -> dict[str, object]:
+    try:
+        message = render_approval_request(request)
+    except ValueError:
+        message = f"Approve {request.action}?\n{request.summary}"
+    return {
+        "call_id": request.call_id,
+        "action": request.action,
+        "summary": request.summary,
+        "message": message,
+    }
+
+
+def _approval_decision_ui_payload(
+    decision: ApprovalDecision,
+) -> dict[str, object]:
+    return {
+        "approval_id": decision.approval_id,
+        "call_id": decision.call_id,
+        "action": decision.action,
+        "summary": decision.summary,
+        "outcome": decision.outcome,
+        "source": decision.source,
+    }
 
 
 class SessionResumeError(RuntimeError):
@@ -199,6 +279,14 @@ class _AgentTurnLimitError(RuntimeError):
     pass
 
 
+def _resolve_ui_emitter(ui_emitter: UiEmitter | None) -> UiEmitter:
+    if ui_emitter is None:
+        return UiEmitter()
+    if not isinstance(ui_emitter, UiEmitter):
+        raise TypeError("ui_emitter must be a UiEmitter or null.")
+    return ui_emitter
+
+
 def run_agent(
     task: str,
     config: AgentConfig,
@@ -206,6 +294,9 @@ def run_agent(
     session_store: SessionStore | None = None,
     approval_handler: ApprovalHandler | None = None,
     fault_injector: FaultInjector | None = None,
+    ui_emitter: UiEmitter | None = None,
+    stream: bool = True,
+    approval_input_reader: ApprovalInputReader | None = None,
 ) -> str:
     return run_agent_with_report(
         task,
@@ -214,6 +305,9 @@ def run_agent(
         session_store=session_store,
         approval_handler=approval_handler,
         fault_injector=fault_injector,
+        ui_emitter=ui_emitter,
+        stream=stream,
+        approval_input_reader=approval_input_reader,
     ).answer
 
 
@@ -224,18 +318,49 @@ def run_agent_with_report(
     session_store: SessionStore | None = None,
     approval_handler: ApprovalHandler | None = None,
     fault_injector: FaultInjector | None = None,
+    ui_emitter: UiEmitter | None = None,
+    stream: bool = True,
+    approval_input_reader: ApprovalInputReader | None = None,
 ) -> AgentRunReport:
+    if not isinstance(stream, bool):
+        raise TypeError("stream must be a boolean.")
+    _validate_agent_task_mode(config)
+    emitter = _resolve_ui_emitter(ui_emitter)
+    if emitter.next_seq == 1:
+        emitter.emit(
+            "run.started",
+            {
+                "workspace": config.workspace,
+                "model": config.model,
+                "mode": config.permission_mode,
+                "task_mode": config.task_mode,
+                "sandbox": config.sandbox_mode,
+            },
+        )
     journal = _start_session(task, config, session_store=session_store)
     audited_approval_handler = _build_audited_approval_handler(
         journal,
-        approval_handler or build_default_approval_handler(config),
+        approval_handler
+        or build_default_approval_handler(
+            config,
+            request_writer=lambda _message: None,
+            input_reader=approval_input_reader,
+        ),
+        emitter,
     )
 
     try:
-        client = model_client or OpenAIResponsesClient()
+        client = model_client or OpenAIResponsesClient(
+            ui_emitter=emitter,
+            stream=stream,
+        )
         verification_state = VerificationToolState(
             task=task,
             max_fix_attempts=config.max_fix_attempts,
+        )
+        emitter.emit(
+            "model.started",
+            {"request_kind": "initial", "turn_index": 1},
         )
         response = _create_initial_model_response(
             task,
@@ -243,17 +368,31 @@ def run_agent_with_report(
             client,
             journal,
         )
+        _emit_model_finished(
+            emitter,
+            response,
+            task_mode=config.task_mode,
+        )
         _inject_fault(fault_injector, "after_model_response")
 
         for _turn in range(config.max_turns):
-            _print_normalized_response(response)
             if not response.function_calls:
                 report = _build_final_report(
                     response,
                     verification_state,
+                    task_mode=config.task_mode,
+                    review=journal.state.review,
+                    explain_evidence=(
+                        _explanation_read_evidence_from_events(
+                            journal.store.load(journal.session_id)
+                        )
+                        if config.task_mode == "explain"
+                        else ()
+                    ),
                     session_id=journal.session_id,
                 )
                 _complete_session(journal, report)
+                _emit_run_finished(emitter, report)
                 return report
 
             tool_outputs = _execute_tool_batch(
@@ -262,14 +401,27 @@ def run_agent_with_report(
                 verification_state,
                 journal,
                 audited_approval_handler,
+                emitter,
                 fault_injector=fault_injector,
             )
             _inject_fault(fault_injector, "before_model_continuation")
+            emitter.emit(
+                "model.started",
+                {
+                    "request_kind": "tool_continuation",
+                    "turn_index": journal.state.turn_index + 1,
+                },
+            )
             response = _create_continuation_model_response(
                 config,
                 client,
                 journal,
                 tool_outputs,
+            )
+            _emit_model_finished(
+                emitter,
+                response,
+                task_mode=config.task_mode,
             )
             _inject_fault(fault_injector, "after_model_response")
 
@@ -287,6 +439,7 @@ def run_agent_with_report(
                 "turn_index": journal.state.turn_index,
             },
             original_error=exc,
+            ui_emitter=emitter,
         )
         raise
     except _AgentTurnLimitError as exc:
@@ -301,6 +454,7 @@ def run_agent_with_report(
                 "max_turns": config.max_turns,
             },
             original_error=exc,
+            ui_emitter=emitter,
         )
         raise
     except Exception as exc:
@@ -317,6 +471,7 @@ def run_agent_with_report(
                 ),
             },
             original_error=exc,
+            ui_emitter=emitter,
         )
         raise
 
@@ -329,6 +484,9 @@ def resume_agent(
     approval_handler: ApprovalHandler | None = None,
     recovery_approval_handler: ApprovalHandler | None = None,
     fault_injector: FaultInjector | None = None,
+    ui_emitter: UiEmitter | None = None,
+    stream: bool = True,
+    approval_input_reader: ApprovalInputReader | None = None,
 ) -> str:
     """Resume one durable session after validating its workspace guard."""
 
@@ -340,6 +498,9 @@ def resume_agent(
         approval_handler=approval_handler,
         recovery_approval_handler=recovery_approval_handler,
         fault_injector=fault_injector,
+        ui_emitter=ui_emitter,
+        stream=stream,
+        approval_input_reader=approval_input_reader,
     ).answer
 
 
@@ -351,9 +512,15 @@ def resume_agent_with_report(
     approval_handler: ApprovalHandler | None = None,
     recovery_approval_handler: ApprovalHandler | None = None,
     fault_injector: FaultInjector | None = None,
+    ui_emitter: UiEmitter | None = None,
+    stream: bool = True,
+    approval_input_reader: ApprovalInputReader | None = None,
 ) -> AgentRunReport:
     """Resume a session without repeating completed tools or ignoring drift."""
 
+    if not isinstance(stream, bool):
+        raise TypeError("stream must be a boolean.")
+    emitter = _resolve_ui_emitter(ui_emitter)
     workspace_path = Path(workspace).resolve()
     store = session_store or SessionStore(workspace_path)
     if store.workspace != workspace_path:
@@ -370,29 +537,82 @@ def resume_agent_with_report(
             )
 
         started = _session_started_from_events(events)
-        config = _resume_config(started, workspace_path)
-        _validate_resume_security(events, started, config, workspace_path)
-        recovery_plans = plan_interrupted_tools(
-            workspace_path,
-            events,
-            state,
-        )
-        validate_workspace_guard(
-            workspace_path,
-            started,
-            state,
-            recovery_plans=recovery_plans,
-        )
-        recovery_call_ids = set(
-            find_recovery_reapproval_call_ids(events, state)
-        )
-        retry_pending_model_request = state.model_request_pending
-        previous_status = state.status
         journal = _SessionJournal(
             store=store,
             session_id=session_id,
             state=state,
         )
+        try:
+            config = _resume_config(started, workspace_path)
+            try:
+                _validate_agent_task_mode(config)
+            except ValueError as exc:
+                raise SessionResumeError(
+                    "Persisted task mode configuration is invalid: " + str(exc)
+                ) from exc
+            if emitter.next_seq == 1:
+                emitter.emit(
+                    "run.started",
+                    _resume_run_started_ui_payload(
+                        workspace_path,
+                        session_id,
+                        config,
+                        state,
+                    ),
+                )
+            _validate_resume_security(events, started, config, workspace_path)
+            recovery_plans = plan_interrupted_tools(
+                workspace_path,
+                events,
+                state,
+            )
+            validate_workspace_guard(
+                workspace_path,
+                started,
+                state,
+                recovery_plans=recovery_plans,
+            )
+        except KeyboardInterrupt as exc:
+            _prepare_resume_preflight_terminal(journal, original_error=exc)
+            _record_terminal_event(
+                journal,
+                "session.interrupted",
+                {
+                    "reason": "keyboard_interrupt",
+                    "error": exc,
+                    "phase": journal.state.phase,
+                    "turn_index": journal.state.turn_index,
+                    "resumed": True,
+                    "preflight": True,
+                },
+                original_error=exc,
+                ui_emitter=emitter,
+            )
+            raise
+        except Exception as exc:
+            _prepare_resume_preflight_terminal(journal, original_error=exc)
+            _record_terminal_event(
+                journal,
+                "session.failed",
+                {
+                    "reason": "preflight_failure",
+                    "error": exc,
+                    "error_code": getattr(exc, "code", type(exc).__name__),
+                    "phase": journal.state.phase,
+                    "turn_index": journal.state.turn_index,
+                    "resumed": True,
+                    "preflight": True,
+                },
+                original_error=exc,
+                ui_emitter=emitter,
+            )
+            raise
+
+        recovery_call_ids = set(
+            find_recovery_reapproval_call_ids(events, state)
+        )
+        retry_pending_model_request = state.model_request_pending
+        previous_status = state.status
         journal.append(
             "session.resumed",
             {
@@ -403,15 +623,27 @@ def resume_agent_with_report(
                 "retry_pending_model_request": retry_pending_model_request,
             },
         )
+        if journal.state.plan.items:
+            emitter.emit("plan.updated", plan_state_to_dict(journal.state.plan))
 
         audited_approval_handler = _build_audited_approval_handler(
             journal,
-            approval_handler or build_default_approval_handler(config),
+            approval_handler
+            or build_default_approval_handler(
+                config,
+                request_writer=lambda _message: None,
+                input_reader=approval_input_reader,
+            ),
+            emitter,
         )
         audited_recovery_handler = _build_audited_approval_handler(
             journal,
             recovery_approval_handler
-            or build_resume_recovery_approval_handler(),
+            or build_resume_recovery_approval_handler(
+                request_writer=lambda _message: None,
+                input_reader=approval_input_reader,
+            ),
+            emitter,
             validator=validate_resume_recovery_decision,
             failure_source="resume_recovery",
         )
@@ -423,9 +655,16 @@ def resume_agent_with_report(
                 events,
                 config,
                 recovery_plans,
+                emitter,
             )
+            recovery_summaries: dict[str, str] = {}
             recovery_call_ids.update(
-                _apply_recovery_plans(journal, recovery_plans)
+                _apply_recovery_plans(
+                    journal,
+                    recovery_plans,
+                    emitter,
+                    recovery_summaries=recovery_summaries,
+                )
             )
             verification_state = verification_tool_state_from_dict(
                 journal.state.verification_state
@@ -437,7 +676,10 @@ def resume_agent_with_report(
                 verification_state,
                 audited_approval_handler,
                 audited_recovery_handler,
+                emitter,
+                stream,
                 recovery_call_ids=frozenset(recovery_call_ids),
+                recovery_summaries=recovery_summaries,
                 retry_initial_model_request=(
                     retry_pending_model_request
                     and state.phase == "awaiting_initial_model"
@@ -456,6 +698,7 @@ def resume_agent_with_report(
                     "resumed": True,
                 },
                 original_error=exc,
+                ui_emitter=emitter,
             )
             raise
         except (_AgentTurnLimitError, ResumeTurnLimitError) as exc:
@@ -471,6 +714,7 @@ def resume_agent_with_report(
                     "resumed": True,
                 },
                 original_error=exc,
+                ui_emitter=emitter,
             )
             raise
         except ResumeModelContextUnavailable as exc:
@@ -488,6 +732,7 @@ def resume_agent_with_report(
                     "resumed": True,
                 },
                 original_error=exc,
+                ui_emitter=emitter,
             )
             raise
         except Exception as exc:
@@ -505,17 +750,63 @@ def resume_agent_with_report(
                     "resumed": True,
                 },
                 original_error=exc,
+                ui_emitter=emitter,
             )
             raise
+
+
+def _prepare_resume_preflight_terminal(
+    journal: _SessionJournal,
+    *,
+    original_error: BaseException,
+) -> None:
+    """Make a terminal resume attempt appendable without consuming a pending request."""
+
+    if journal.state.status == "running":
+        return
+    previous_status = journal.state.status
+    try:
+        journal.append(
+            "session.resumed",
+            {
+                "reason": "resume_preflight",
+                "previous_status": previous_status,
+                "phase": journal.state.phase,
+                "turn_index": journal.state.turn_index,
+                "retry_pending_model_request": False,
+            },
+        )
+    except BaseException as persistence_error:
+        original_error.add_note(
+            "Additionally, the failed resume attempt could not reopen the "
+            "session for terminal persistence: "
+            f"{type(persistence_error).__name__}: {persistence_error}"
+        )
+
 
 def _apply_recovery_plans(
     journal: _SessionJournal,
     plans: Sequence[ToolRecoveryPlan],
+    ui_emitter: UiEmitter,
+    *,
+    recovery_summaries: dict[str, str] | None = None,
 ) -> set[str]:
     recovery_call_ids: set[str] = set()
+    summaries = recovery_summaries if recovery_summaries is not None else {}
     appended = False
     for plan in plans:
         if plan.disposition == "reuse_completed":
+            ui_emitter.emit(
+                "tool.finished",
+                {
+                    "call_id": plan.call_id,
+                    "name": plan.name,
+                    "status": "passed",
+                    "duration_ms": 0,
+                    "summary": "recovered: reused completed tool output",
+                    "output_truncated": False,
+                },
+            )
             continue
         payload = build_recovery_event_payload(
             plan,
@@ -524,8 +815,31 @@ def _apply_recovery_plans(
         )
         journal.append("tool.recovered", payload)
         appended = True
-        if plan.requires_explicit_approval:
+        if plan.disposition == "safe_retry":
+            summaries[plan.call_id] = "recovery: safe retry"
+        elif plan.requires_explicit_approval:
             recovery_call_ids.add(plan.call_id)
+            summaries[plan.call_id] = "recovery: reapproval required"
+        elif plan.disposition == "recovered_completed":
+            if plan.recovered_result is None:
+                raise RuntimeError(
+                    "Recovered completion is missing its UI result projection."
+                )
+            recovered_payload = _tool_finished_ui_payload(
+                ModelFunctionCall(
+                    call_id=plan.call_id,
+                    name=plan.name,
+                    arguments="{}",
+                ),
+                plan.recovered_result,
+            )
+            recovered_summary = recovered_payload.get("summary")
+            recovered_payload["summary"] = (
+                "recovered: completed tool result"
+                if not isinstance(recovered_summary, str)
+                else f"recovered: completed tool result\n{recovered_summary}"
+            )
+            ui_emitter.emit("tool.finished", recovered_payload)
     if appended:
         journal.checkpoint()
     return recovery_call_ids
@@ -538,19 +852,33 @@ def _resume_session_loop(
     verification_state: VerificationToolState,
     approval_handler: ApprovalHandler,
     recovery_approval_handler: ApprovalHandler,
+    ui_emitter: UiEmitter,
+    stream: bool,
     *,
     recovery_call_ids: frozenset[str],
+    recovery_summaries: Mapping[str, str],
     retry_initial_model_request: bool,
     fault_injector: FaultInjector | None,
 ) -> AgentRunReport:
     initial_retry_pending = retry_initial_model_request
     recovery_ids = set(recovery_call_ids)
+    recovery_start_summaries = dict(recovery_summaries)
 
     while True:
         phase = journal.state.phase
         if phase == "awaiting_initial_model":
             if client is None:
-                client = OpenAIResponsesClient()
+                client = OpenAIResponsesClient(
+                    ui_emitter=ui_emitter,
+                    stream=stream,
+                )
+            ui_emitter.emit(
+                "model.started",
+                {
+                    "request_kind": "initial",
+                    "turn_index": journal.state.turn_index + 1,
+                },
+            )
             response = _resume_initial_model_response(
                 config,
                 client,
@@ -560,7 +888,11 @@ def _resume_session_loop(
             initial_retry_pending = False
             _inject_fault(fault_injector, "after_model_response")
             if response.function_calls:
-                _print_normalized_response(response)
+                _emit_model_finished(
+                    ui_emitter,
+                    response,
+                    task_mode=config.task_mode,
+                )
             continue
 
         if phase == "awaiting_tools":
@@ -585,19 +917,32 @@ def _resume_session_loop(
                 verification_state,
                 journal,
                 approval_handler,
+                ui_emitter,
                 fault_injector=fault_injector,
                 approval_handlers_by_call_id=handlers_by_call_id,
+                recovery_summaries_by_call_id=recovery_start_summaries,
             )
             recovery_ids.clear()
+            recovery_start_summaries.clear()
             continue
 
         if phase == "awaiting_model":
             if client is None:
-                client = OpenAIResponsesClient()
+                client = OpenAIResponsesClient(
+                    ui_emitter=ui_emitter,
+                    stream=stream,
+                )
             tool_outputs = pending_outputs_for_model(
                 journal.state.pending_tool_outputs
             )
             _inject_fault(fault_injector, "before_model_continuation")
+            ui_emitter.emit(
+                "model.started",
+                {
+                    "request_kind": "tool_continuation",
+                    "turn_index": journal.state.turn_index + 1,
+                },
+            )
             response = _resume_continuation_model_response(
                 config,
                 client,
@@ -606,20 +951,35 @@ def _resume_session_loop(
             )
             _inject_fault(fault_injector, "after_model_response")
             if response.function_calls:
-                _print_normalized_response(response)
+                _emit_model_finished(
+                    ui_emitter,
+                    response,
+                    task_mode=config.task_mode,
+                )
             continue
 
         if phase == "finalizing":
-            response = _last_model_response(
-                journal.store.load(journal.session_id)
+            events = journal.store.load(journal.session_id)
+            response = _last_model_response(events)
+            _emit_model_finished(
+                ui_emitter,
+                response,
+                task_mode=config.task_mode,
             )
-            _print_normalized_response(response)
             report = _build_final_report(
                 response,
                 verification_state,
+                task_mode=config.task_mode,
+                review=journal.state.review,
+                explain_evidence=(
+                    _explanation_read_evidence_from_events(events)
+                    if config.task_mode == "explain"
+                    else ()
+                ),
                 session_id=journal.session_id,
             )
             _complete_session(journal, report)
+            _emit_run_finished(ui_emitter, report)
             return report
 
         if phase == "completed":
@@ -815,6 +1175,11 @@ def _resume_config(
         raise SessionResumeError(
             "Persisted session config 'full_auto' must be a boolean."
         )
+    task_mode = config.get("task_mode", "run")
+    if not isinstance(task_mode, str) or task_mode not in TASK_MODES:
+        raise SessionResumeError(
+            f"Unsupported persisted task mode: {task_mode!r}."
+        )
     return AgentConfig(
         workspace=str(workspace),
         model=model,
@@ -833,6 +1198,45 @@ def _resume_config(
         sandbox_image=sandbox_image,
         sandbox_image_digest=sandbox_image_digest,
         full_auto=full_auto,
+        task_mode=cast(TaskMode, task_mode),
+    )
+
+
+def _resume_run_started_ui_payload(
+    workspace: Path,
+    session_id: str,
+    config: AgentConfig,
+    state: AgentSessionState,
+) -> dict[str, object]:
+    items = state.plan.items
+    return {
+        "workspace": str(workspace),
+        "session_id": session_id,
+        "mode": "resume",
+        "model": config.model,
+        "task_mode": config.task_mode,
+        "permission": config.permission_mode,
+        "sandbox": config.sandbox_mode,
+        "previous_phase": state.phase,
+        "previous_status": state.status,
+        "plan_progress": {
+            "completed": sum(item.status == "completed" for item in items),
+            "in_progress": sum(
+                item.status == "in_progress" for item in items
+            ),
+            "pending": sum(item.status == "pending" for item in items),
+            "total": len(items),
+        },
+    }
+
+
+def _validate_agent_task_mode(config: AgentConfig) -> None:
+    validate_task_mode_configuration(
+        config.task_mode,
+        permission_mode=config.permission_mode,
+        auto_approve_edits=config.auto_approve_edits,
+        auto_approve_commands=config.auto_approve_commands,
+        full_auto=config.full_auto,
     )
 
 
@@ -907,6 +1311,7 @@ def _reconcile_interrupted_sandboxes(
     events: Sequence[SessionEvent],
     config: AgentConfig,
     plans: Sequence[ToolRecoveryPlan],
+    ui_emitter: UiEmitter,
 ) -> tuple[ToolRecoveryPlan, ...]:
     starts = {
         event.payload.get("call_id"): event.payload
@@ -941,6 +1346,19 @@ def _reconcile_interrupted_sandboxes(
                     "name": plan.name,
                     "cleanup_kind": "container",
                     "reason": error or "Interrupted container cleanup failed.",
+                },
+            )
+            ui_emitter.emit(
+                "tool.finished",
+                {
+                    "call_id": plan.call_id,
+                    "name": plan.name,
+                    "status": "failed",
+                    "duration_ms": 0,
+                    "backend": "docker",
+                    "sandboxed": True,
+                    "summary": "sandbox cleanup failed: container",
+                    "output_truncated": False,
                 },
             )
             raise SessionSecurityDriftError(
@@ -1062,7 +1480,6 @@ def _start_session(
     )
     session_id = store.create(session_started_to_dict(started))
     state = rebuild_state(store.load(session_id))
-    print(f"session: {session_id}")
     return _SessionJournal(store=store, session_id=session_id, state=state)
 
 
@@ -1169,9 +1586,11 @@ def _execute_tool_batch(
     verification_state: VerificationToolState,
     journal: _SessionJournal,
     approval_handler: ApprovalHandler,
+    ui_emitter: UiEmitter,
     *,
     fault_injector: FaultInjector | None = None,
     approval_handlers_by_call_id: Mapping[str, ApprovalHandler] | None = None,
+    recovery_summaries_by_call_id: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     for call in response.function_calls:
         pending_call = _pending_call(journal.state, call.call_id)
@@ -1188,16 +1607,26 @@ def _execute_tool_batch(
                 "requires_approval": policy.approval_required,
             },
         )
+        started_ui_payload: dict[str, object] = {
+            "call_id": call.call_id,
+            "name": call.name,
+        }
+        if recovery_summaries_by_call_id is not None:
+            recovery_summary = recovery_summaries_by_call_id.get(call.call_id)
+            if recovery_summary:
+                started_ui_payload["summary"] = recovery_summary
+        ui_emitter.emit("tool.started", started_ui_payload)
 
         before_verification = verification_tool_state_to_dict(verification_state)
         before_history_count = len(verification_state.verification_history)
-        print(f"\ntool: {call.name}")
         call_approval_handler = approval_handler
         if approval_handlers_by_call_id is not None:
             call_approval_handler = approval_handlers_by_call_id.get(
                 call.call_id,
                 approval_handler,
             )
+
+        security_ui_state = _ToolSecurityUiState()
 
         def record_security_event(
             event_type: str,
@@ -1212,21 +1641,70 @@ def _execute_tool_batch(
                     **payload,
                 },
             )
+            _update_security_ui_state(
+                security_ui_state,
+                event_type,
+                payload,
+            )
 
         result = execute_tool(
             config,
             call.name,
             call.arguments,
             state=verification_state,
+            plan_state=journal.state.plan,
+            review_result=journal.state.review,
             approval_handler=call_approval_handler,
             call_id=call.call_id,
             session_id=journal.session_id,
             security_event_handler=record_security_event,
         )
         _inject_fault(fault_injector, "after_tool_side_effect")
-        print("ok" if result.ok else "failed")
-        if result.output:
-            print(_truncate_for_console(result.output))
+
+        if call.name == "update_plan" and result.ok:
+            if result.data is None or result.data.get("type") != "plan_update":
+                raise RuntimeError(
+                    "update_plan returned no structured plan update."
+                )
+            plan_data = result.data.get("plan")
+            if not isinstance(plan_data, Mapping):
+                raise RuntimeError("update_plan returned an invalid plan payload.")
+            updated_plan = plan_state_from_dict(plan_data)
+            journal.append(
+                "plan.updated",
+                {"plan": plan_state_to_dict(updated_plan)},
+            )
+            ui_emitter.emit(
+                "plan.updated",
+                plan_state_to_dict(journal.state.plan),
+            )
+
+        submitted_review: ReviewResult | None = None
+        if call.name == "submit_review" and result.ok:
+            if (
+                result.data is None
+                or result.data.get("type") != "review_submission"
+            ):
+                raise RuntimeError(
+                    "submit_review returned no structured review submission."
+                )
+            review_data = result.data.get("review")
+            if not isinstance(review_data, Mapping):
+                raise RuntimeError(
+                    "submit_review returned an invalid review payload."
+                )
+            submitted_review = review_result_from_dict(review_data)
+
+        read_evidence: tuple[ExplanationReadEvidence, ...] | None = None
+        if call.name in {"read_file", "read_many_files"} and result.ok:
+            try:
+                read_evidence = explanation_read_evidence_from_tool_data(
+                    result.data
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"{call.name} returned invalid structured read evidence."
+                ) from exc
 
         tool_output = build_persistable_tool_output(
             journal.store,
@@ -1259,7 +1737,25 @@ def _execute_tool_batch(
             execution_audit = _execution_audit(result.data)
             if execution_audit is not None:
                 finished_payload["execution"] = execution_audit
+        if submitted_review is not None:
+            finished_payload["review"] = review_result_to_dict(submitted_review)
+        if read_evidence is not None:
+            finished_payload["read_evidence"] = (
+                explanation_read_evidence_list_to_dict(read_evidence)
+            )
         journal.append("tool.finished", finished_payload)
+        if submitted_review is not None and journal.state.review != submitted_review:
+            raise RuntimeError(
+                "Persisted review state diverged from the submitted review."
+            )
+        ui_emitter.emit(
+            "tool.finished",
+            _tool_finished_ui_payload(
+                call,
+                result,
+                security_ui_state=security_ui_state,
+            ),
+        )
         _inject_fault(fault_injector, "after_tool_finished")
 
         for verification in new_verifications:
@@ -1268,6 +1764,18 @@ def _execute_tool_batch(
                 {
                     "result": verification_result_to_dict(verification),
                     "verification_state": after_verification,
+                },
+            )
+            ui_emitter.emit(
+                "verification.finished",
+                {
+                    "command_id": verification.command_id,
+                    "kind": verification.kind,
+                    "status": verification.status,
+                    "exit_code": verification.exit_code,
+                    "duration_ms": verification.duration_ms,
+                    "attempt": verification.attempt,
+                    "output_truncated": verification.truncated,
                 },
             )
         persisted_verification = verification_tool_state_to_dict(
@@ -1362,18 +1870,263 @@ def _execution_audit(data: Mapping[str, object]) -> dict[str, object] | None:
             "status",
             *policy_keys,
         )
+    elif data_type == "task_mode_policy_rejection":
+        keys = (
+            "task_mode",
+            "tool_name",
+            "status",
+            "disposition",
+            "requires_approval",
+        )
     else:
         return None
     return {key: data[key] for key in keys if key in data}
 
+
+def _tool_finished_ui_payload(
+    call: ModelFunctionCall,
+    result: ToolResult,
+    *,
+    security_ui_state: _ToolSecurityUiState | None = None,
+) -> dict[str, object]:
+    data = result.data or {}
+    state = security_ui_state or _ToolSecurityUiState()
+    _update_security_ui_state_from_result(state, data)
+
+    duration = data.get("duration_ms")
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, int)
+        or duration < 0
+    ):
+        duration = 0
+
+    safe_output = _redact_security_console_text(
+        result.output,
+        state.sensitive_identifiers,
+    )
+    summary_parts = _security_ui_summary_lines(state)
+    if safe_output:
+        summary_parts.append(safe_output)
+    combined_summary = "\n".join(summary_parts)
+    summary = truncate_for_console(combined_summary)
+
+    payload: dict[str, object] = {
+        "call_id": call.call_id,
+        "name": call.name,
+        "status": "passed" if result.ok else "failed",
+        "duration_ms": duration,
+        "output_truncated": (
+            summary != combined_summary or data.get("output_truncated") is True
+        ),
+    }
+    backend = data.get("backend")
+    if not isinstance(backend, str) or not backend:
+        backend = state.backend
+    if isinstance(backend, str) and backend:
+        payload["backend"] = backend
+    sandboxed = data.get("sandboxed")
+    if not isinstance(sandboxed, bool):
+        sandboxed = state.sandboxed
+    if isinstance(sandboxed, bool):
+        payload["sandboxed"] = sandboxed
+    if summary:
+        payload["summary"] = summary
+    return payload
+
+
+def _update_security_ui_state(
+    state: _ToolSecurityUiState,
+    event_type: str,
+    payload: Mapping[str, object],
+) -> None:
+    if event_type == "sandbox.capability_checked":
+        capability = payload.get("capability")
+        if isinstance(capability, Mapping):
+            available = capability.get("available")
+            state.capability_status = (
+                "available" if available is True else "unavailable"
+            )
+            _update_security_ui_state_from_mapping(state, capability)
+            _remember_sensitive_security_value(state, capability.get("reason"))
+            if not isinstance(capability.get("image_digest"), str):
+                state.image_digest_status = "unavailable"
+        return
+    if event_type == "sandbox.started":
+        state.sandboxed = True
+        _update_security_ui_state_from_mapping(state, payload)
+        return
+    if event_type == "sandbox.finished":
+        result = payload.get("result")
+        if isinstance(result, Mapping):
+            _update_security_ui_state_from_mapping(state, result)
+        return
+    if event_type == "sandbox.cleanup_failed":
+        cleanup_kind = payload.get("cleanup_kind")
+        state.cleanup_failures.add(
+            cleanup_kind if isinstance(cleanup_kind, str) and cleanup_kind else "sandbox"
+        )
+        _remember_sensitive_security_value(state, payload.get("reason"))
+
+
+def _update_security_ui_state_from_result(
+    state: _ToolSecurityUiState,
+    data: Mapping[str, object],
+) -> None:
+    _update_security_ui_state_from_mapping(state, data)
+    for cleanup_kind, key in (
+        ("container", "container_cleanup_succeeded"),
+        ("snapshot", "snapshot_cleanup_succeeded"),
+    ):
+        if data.get(key) is False:
+            state.cleanup_failures.add(cleanup_kind)
+
+
+def _update_security_ui_state_from_mapping(
+    state: _ToolSecurityUiState,
+    data: Mapping[str, object],
+) -> None:
+    backend = data.get("backend")
+    if isinstance(backend, str) and backend:
+        state.backend = backend
+    sandboxed = data.get("sandboxed")
+    if isinstance(sandboxed, bool):
+        state.sandboxed = sandboxed
+
+    image_digest = data.get("image_digest")
+    if isinstance(image_digest, str) and image_digest:
+        state.image_digest_status = "verified"
+        state.sensitive_identifiers.add(image_digest)
+    container_name = data.get("container_name")
+    if isinstance(container_name, str) and container_name:
+        state.sensitive_identifiers.add(container_name)
+    for key in (
+        "reason",
+        "error_reason",
+        "snapshot_cleanup_error",
+        "container_cleanup_error",
+    ):
+        _remember_sensitive_security_value(state, data.get(key))
+
+
+def _remember_sensitive_security_value(
+    state: _ToolSecurityUiState,
+    value: object,
+) -> None:
+    if isinstance(value, str) and value:
+        state.sensitive_identifiers.add(value)
+
+
+def _security_ui_summary_lines(state: _ToolSecurityUiState) -> list[str]:
+    summary: list[str] = []
+    if state.capability_status is not None:
+        summary.append(f"sandbox capability {state.capability_status}")
+    if state.image_digest_status is not None:
+        summary.append(f"sandbox image digest {state.image_digest_status}")
+    summary.extend(
+        f"sandbox cleanup failed: {cleanup_kind}"
+        for cleanup_kind in sorted(state.cleanup_failures)
+    )
+    return summary
+
+
+def _redact_security_console_text(
+    value: str,
+    sensitive_identifiers: set[str],
+) -> str:
+    redacted = re.sub(
+        r"sha256:[0-9a-fA-F]{64}",
+        "[image digest redacted]",
+        value,
+    )
+    for identifier in sorted(sensitive_identifiers, key=len, reverse=True):
+        replacement = (
+            "[image digest redacted]"
+            if identifier.startswith("sha256:")
+            else "[sandbox detail redacted]"
+        )
+        redacted = redacted.replace(identifier, replacement)
+    return redacted
+
+
+def _emit_model_finished(
+    ui_emitter: UiEmitter,
+    response: NormalizedModelResponse,
+    *,
+    task_mode: TaskMode,
+) -> None:
+    ui_emitter.emit(
+        "model.finished",
+        {
+            "response_id": response.response_id,
+            "text": response.text,
+            "reasoning_summary": (
+                "" if task_mode == "explain" else response.reasoning_summary
+            ),
+            "has_tool_calls": bool(response.function_calls),
+        },
+    )
+
+
+def _emit_run_finished(
+    ui_emitter: UiEmitter,
+    report: AgentRunReport,
+) -> None:
+    ui_emitter.emit(
+        "run.finished",
+        {
+            "status": "completed",
+            "final_status": report.final_status,
+            "session_id": report.session_id,
+            "answer": report.answer,
+            "review": (
+                review_result_to_dict(report.review)
+                if report.review is not None
+                else None
+            ),
+        },
+    )
+
+
+
+def _explanation_read_evidence_from_events(
+    events: Sequence[SessionEvent],
+) -> tuple[ExplanationReadEvidence, ...]:
+    collected: list[ExplanationReadEvidence] = []
+    for event in events:
+        if event.type != "tool.finished":
+            continue
+        payload = event.payload.get("read_evidence")
+        if payload is None:
+            continue
+        try:
+            collected.extend(
+                explanation_read_evidence_list_from_dict(payload)
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Persisted explain read evidence is invalid at "
+                f"session event {event.seq}."
+            ) from exc
+    return merge_explanation_read_evidence(collected)
 
 
 def _build_final_report(
     response: NormalizedModelResponse,
     verification_state: VerificationToolState,
     *,
+    task_mode: TaskMode,
+    review: ReviewResult | None,
+    explain_evidence: Sequence[ExplanationReadEvidence],
     session_id: str,
 ) -> AgentRunReport:
+    if task_mode == "review" and review is None:
+        raise RuntimeError(
+            "review mode requires one successful submit_review call before "
+            "the final model response."
+        )
+    if task_mode == "explain":
+        validate_explanation_answer(response.text, explain_evidence)
     answer = response.text
     final_status = _verification_final_status(verification_state)
     if final_status == "failed":
@@ -1385,6 +2138,7 @@ def _build_final_report(
         verifications=tuple(verification_state.verification_history),
         final_status=final_status,
         session_id=session_id,
+        review=review,
     )
 
 
@@ -1399,6 +2153,11 @@ def _complete_session(
         "verifications": [
             verification_result_to_dict(result) for result in report.verifications
         ],
+        "review": (
+            review_result_to_dict(report.review)
+            if report.review is not None
+            else None
+        ),
     }
     report_bytes = json.dumps(
         payload,
@@ -1427,6 +2186,7 @@ def _record_terminal_event(
     payload: Mapping[str, object],
     *,
     original_error: BaseException,
+    ui_emitter: UiEmitter | None = None,
 ) -> None:
     if journal.state.status != "running":
         return
@@ -1437,6 +2197,43 @@ def _record_terminal_event(
             "Additionally, the terminal session event could not be persisted: "
             f"{type(persistence_error).__name__}: {persistence_error}"
         )
+        return
+
+    if ui_emitter is None:
+        return
+    ui_payload = _terminal_ui_payload(payload)
+    try:
+        ui_emitter.emit(
+            "run.interrupted"
+            if event_type == "session.interrupted"
+            else "run.failed",
+            ui_payload,
+        )
+    except BaseException as ui_error:
+        original_error.add_note(
+            "Additionally, the terminal UI event could not be emitted: "
+            f"{type(ui_error).__name__}: {ui_error}"
+        )
+
+
+def _terminal_ui_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key in (
+        "reason",
+        "phase",
+        "turn_index",
+        "max_turns",
+        "resumed",
+        "model_request_may_have_succeeded",
+    ):
+        value = payload.get(key)
+        if isinstance(value, (str, int, bool)) and not (
+            key == "turn_index" and isinstance(value, bool)
+        ):
+            result[key] = value
+    if "reason" not in result:
+        result["reason"] = "interrupted"
+    return result
 
 
 def _context_payload(
@@ -1466,13 +2263,6 @@ def _pending_call(state: AgentSessionState, call_id: str) -> PendingToolCall:
         if call.call_id == call_id:
             return call
     raise RuntimeError(f"No pending tool call exists for {call_id!r}.")
-
-
-def _print_normalized_response(response: NormalizedModelResponse) -> None:
-    if response.reasoning_summary:
-        print(f"\nreasoning summary:\n{response.reasoning_summary}")
-    if response.text:
-        print(f"\n{response.text}")
 
 
 def _verification_final_status(
@@ -1547,20 +2337,9 @@ def _get_output_text(response: Any) -> str:
     return normalize_model_response(response).text
 
 
-def _print_response_messages(response: Any) -> None:
-    _print_normalized_response(normalize_model_response(response))
-
-
 def _inject_fault(
     injector: FaultInjector | None,
     point: FaultPoint,
 ) -> None:
     if injector is not None:
         injector(point)
-
-
-def _truncate_for_console(value: str) -> str:
-    limit = 2000
-    if len(value) <= limit:
-        return value
-    return f"{value[:limit]}\n[console output truncated]"

@@ -6,6 +6,13 @@ from collections.abc import Mapping, Sequence
 from typing import cast
 
 from ..approvals import APPROVAL_OUTCOMES, validate_approval_decision
+from ..plans import (
+    EMPTY_PLAN,
+    PlanState,
+    plan_state_from_dict,
+    plan_state_to_dict,
+)
+from ..reviews import ReviewResult, review_result_to_dict
 from ..security.path_policy import (
     SENSITIVE_PATH_DENIAL_REASON,
     load_sensitive_path_policy,
@@ -17,6 +24,7 @@ from .codec import (
     artifact_ref_to_dict,
 )
 from .models import ArtifactRef, JsonValue, SessionEvent
+from .reducer import rebuild_state
 from .store import ArtifactNotFoundError, SessionStore
 
 REPLAY_SCHEMA_VERSION = 2
@@ -52,6 +60,8 @@ def build_session_replay_payload(
     first = events[0]
     last = events[-1]
     started = _started_payload(first)
+    plan = _replay_plan(events)
+    review = _replay_review(events)
     approvals = rebuild_approval_projection(events)
     approvals_by_call_id = _approvals_by_call_id(approvals)
     tool_names = _tool_names_by_call_id(events)
@@ -87,11 +97,76 @@ def build_session_replay_payload(
             "updated_at": last.recorded_at,
             "last_event_type": last.type,
         },
+        "plan": plan_state_to_dict(plan),
+        "plan_updates": _plan_update_projection(events),
+        "review": (
+            review_result_to_dict(review) if review is not None else None
+        ),
+        "terminal": _terminal_projection(events),
         "verbose": verbose,
         "timeline": timeline,
         "verifications": _verification_projection(events),
         "approvals": list(approvals),
     }
+
+
+def _plan_update_projection(
+    events: Sequence[SessionEvent],
+) -> list[dict[str, object]]:
+    updates: list[dict[str, object]] = []
+    for event in events:
+        if event.type != "plan.updated":
+            continue
+        plan_data = _required_mapping(event.payload, "plan")
+        plan = plan_state_from_dict(plan_data, allow_empty=False)
+        updates.append(
+            {
+                "seq": event.seq,
+                "recorded_at": event.recorded_at,
+                "plan": plan_state_to_dict(plan),
+            }
+        )
+    return updates
+
+
+def _terminal_projection(
+    events: Sequence[SessionEvent],
+) -> dict[str, object] | None:
+    last = events[-1]
+    status = _TERMINAL_EVENT_STATUSES.get(last.type)
+    if status is None:
+        return None
+    terminal: dict[str, object] = {
+        "status": status,
+        "event_type": last.type,
+        "seq": last.seq,
+        "recorded_at": last.recorded_at,
+    }
+    reason = _string_value(last.payload.get("reason"))
+    if reason is not None:
+        terminal["reason"] = reason
+    final_status = _report_value(last.payload, "final_status")
+    if final_status is not None:
+        terminal["final_status"] = final_status
+    return terminal
+
+
+def _replay_plan(events: tuple[SessionEvent, ...]) -> PlanState:
+    """Read plans from reducer state while preserving plan-less legacy logs."""
+
+    if not any(event.type == "plan.updated" for event in events):
+        return EMPTY_PLAN
+    return rebuild_state(events).plan
+
+
+def _replay_review(events: tuple[SessionEvent, ...]) -> ReviewResult | None:
+    if not any(
+        event.type == "tool.finished"
+        and isinstance(event.payload.get("review"), Mapping)
+        for event in events
+    ):
+        return None
+    return rebuild_state(events).review
 
 
 def rebuild_approval_projection(
@@ -294,6 +369,21 @@ def _event_summary(
             )
         summary += f" -> {status}"
         return summary, _details(call_id=call_id, name=name, status=status)
+    if event.type == "plan.updated":
+        plan_data = _required_mapping(payload, "plan")
+        plan = plan_state_from_dict(plan_data, allow_empty=False)
+        completed = sum(item.status == "completed" for item in plan.items)
+        in_progress = sum(item.status == "in_progress" for item in plan.items)
+        pending = sum(item.status == "pending" for item in plan.items)
+        return (
+            f"plan updated ({len(plan.items)} items, {completed} completed)",
+            {
+                "item_count": len(plan.items),
+                "completed_count": completed,
+                "in_progress_count": in_progress,
+                "pending_count": pending,
+            },
+        )
     if event.type == "verification.recorded":
         result = _optional_mapping(payload.get("result")) or payload
         command_id = _string_value(result.get("command_id")) or "unknown"
@@ -636,7 +726,7 @@ def _required_mapping(
 ) -> Mapping[str, object]:
     value = payload.get(key)
     if not isinstance(value, Mapping):
-        raise ValueError(f"approval event field {key!r} must be an object.")
+        raise ValueError(f"event field {key!r} must be an object.")
     return cast(Mapping[str, object], value)
 
 

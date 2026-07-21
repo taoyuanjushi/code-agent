@@ -1,5 +1,17 @@
 """Session persistence models, privacy policy, and durable storage."""
 
+from ..plans import (
+    EMPTY_PLAN,
+    PLAN_MAX_EXPLANATION_CHARS,
+    PLAN_MAX_IN_PROGRESS,
+    PLAN_MAX_ITEMS,
+    PLAN_MAX_STEP_CHARS,
+    PLAN_MIN_ITEMS,
+    PLAN_STATUSES,
+    PlanItem,
+    PlanState,
+    PlanStatus,
+)
 from .models import (
     APPROVAL_OUTCOMES,
     APPROVAL_SOURCES,
@@ -85,6 +97,16 @@ from .workspace_guard import (
 )
 
 __all__ = [
+    "EMPTY_PLAN",
+    "PLAN_MAX_EXPLANATION_CHARS",
+    "PLAN_MAX_IN_PROGRESS",
+    "PLAN_MAX_ITEMS",
+    "PLAN_MAX_STEP_CHARS",
+    "PLAN_MIN_ITEMS",
+    "PLAN_STATUSES",
+    "PlanItem",
+    "PlanState",
+    "PlanStatus",
     "APPROVAL_OUTCOMES",
     "APPROVAL_SOURCES",
     "APPROVAL_QUERY_SCHEMA_VERSION",

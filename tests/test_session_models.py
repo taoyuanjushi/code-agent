@@ -38,7 +38,7 @@ def test_session_domain_literal_sets_are_fixed() -> None:
         "finalizing",
         "completed",
     }
-    assert TOOL_EFFECTS == {"read_only", "workspace_write", "process"}
+    assert TOOL_EFFECTS == {"read_only", "session_only", "workspace_write", "process"}
     assert APPROVAL_OUTCOMES == {"approved", "denied"}
     assert APPROVAL_SOURCES == {
         "interactive",
@@ -62,6 +62,7 @@ def test_session_event_supports_the_complete_m4_event_vocabulary() -> None:
         "tool.recovered",
         "approval.decided",
         "verification.recorded",
+        "plan.updated",
         "security.policy_evaluated",
         "sandbox.capability_checked",
         "sandbox.snapshot_created",
@@ -222,6 +223,7 @@ def test_session_started_accepts_only_the_safe_config_whitelist() -> None:
         "sandbox_image",
         "sandbox_image_digest",
         "full_auto",
+        "task_mode",
         "security_policy_version",
     }
     guard = WorkspaceGuard("D:/code/project", None, {})

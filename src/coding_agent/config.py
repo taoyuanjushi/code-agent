@@ -2,6 +2,7 @@ import os
 from argparse import Namespace
 from pathlib import Path
 
+from .task_modes import TASK_MODES, TaskMode
 from .types import (
     MAX_FIX_ATTEMPTS,
     AgentConfig,
@@ -69,6 +70,9 @@ def load_config(options: Namespace) -> AgentConfig:
             or "python:3.12-slim"
         ),
         full_auto=full_auto,
+        task_mode=_parse_task_mode(
+            getattr(options, "task_mode", None) or "run"
+        ),
     )
 
 
@@ -104,6 +108,12 @@ def _parse_reasoning_effort(value: str) -> ReasoningEffort:
     if value not in VALID_REASONING_EFFORTS:
         raise ValueError(f"Invalid reasoning effort: {value}")
 
+    return value  # type: ignore[return-value]
+
+
+def _parse_task_mode(value: str) -> TaskMode:
+    if value not in TASK_MODES:
+        raise ValueError(f"Invalid task mode: {value}")
     return value  # type: ignore[return-value]
 
 

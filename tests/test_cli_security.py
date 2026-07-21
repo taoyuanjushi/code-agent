@@ -113,20 +113,28 @@ def test_successful_preflight_passes_pinned_config_to_agent(
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     observed = []
 
-    def fake_run(task, config):
-        observed.append((task, config))
+    def fake_run(task, config, **kwargs):
+        observed.append((task, config, kwargs))
         return AgentRunReport("done", (), "not_run")
 
     monkeypatch.setattr(cli_module, "run_agent_with_report", fake_run)
 
     exit_code = main(
-        ["--workspace", str(tmp_path), "--sandbox", "docker", "inspect"]
+        [
+            "--workspace",
+            str(tmp_path),
+            "--sandbox",
+            "docker",
+            "--no-stream",
+            "inspect",
+        ]
     )
 
     assert exit_code == 0
     assert observed[0][0] == "inspect"
     assert observed[0][1].sandbox_mode == "docker"
     assert observed[0][1].sandbox_image_digest == IMAGE_DIGEST
+    assert observed[0][2]["stream"] is False
 
 
 def test_pinned_docker_config_never_falls_back_to_host_commands(
@@ -211,5 +219,5 @@ def test_resume_rejects_sandbox_overrides(
 
     exit_code = main(["--resume", "latest", *options])
 
-    assert exit_code == 1
+    assert exit_code == 2
     assert "may only be used when starting a new task" in capsys.readouterr().err

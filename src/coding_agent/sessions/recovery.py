@@ -11,7 +11,7 @@ from typing import Literal, cast
 from ..approvals import ApprovalRequest
 from ..path_safety import resolve_workspace_path
 from ..tool_outputs import build_persistable_tool_output, thaw_json
-from ..tool_policy import ToolEffect, hash_tool_arguments
+from ..tool_policy import TOOL_EFFECTS, ToolEffect, hash_tool_arguments
 from ..tools import VerificationToolState
 from ..types import ToolResult
 from .codec import (
@@ -192,7 +192,7 @@ def plan_tool_recovery(
             f"Tool call {call_id!r} has no interrupted tool.started event."
         )
 
-    if call.effect == "read_only":
+    if call.effect in {"read_only", "session_only"}:
         return ToolRecoveryPlan(
             call_id=call.call_id,
             name=call.name,
@@ -495,7 +495,7 @@ def _completed_identity(
             continue
         name = _required_string(data.get("name"), "completed tool name")
         effect = data.get("effect")
-        if effect not in {"read_only", "workspace_write", "process"}:
+        if effect not in TOOL_EFFECTS:
             raise ToolRecoveryError(
                 f"Completed tool call {call_id!r} has no valid effect metadata."
             )

@@ -168,7 +168,7 @@ def test_latest_uses_updated_event_time_then_session_id() -> None:
     assert resolve_session_selector(FakeStore(), "latest") == tied_high.session_id
 
 
-def test_resume_prints_resolved_session_before_calling_agent(
+def test_resume_emits_resolved_session_before_calling_agent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -183,28 +183,47 @@ def test_resume_prints_resolved_session_before_calling_agent(
         workspace: Path,
         *,
         session_store: SessionStore,
+        ui_emitter,
+        stream: bool,
     ) -> AgentRunReport:
         printed_before_call = capsys.readouterr().out
-        assert f"session: {session_id}" in printed_before_call
+        assert "run.started" in printed_before_call
+        assert session_id in printed_before_call
         observed["session_id"] = selected_session_id
         observed["workspace"] = workspace
         observed["store"] = session_store
-        return AgentRunReport(
+        observed["stream"] = stream
+        report = AgentRunReport(
             answer="resumed",
             verifications=(),
             final_status="not_run",
             session_id=selected_session_id,
         )
+        ui_emitter.emit(
+            "run.finished",
+            {
+                "status": "completed",
+                "final_status": report.final_status,
+                "session_id": report.session_id,
+                "answer": report.answer,
+            },
+        )
+        return report
 
     monkeypatch.setattr(cli_module, "resume_agent_with_report", fake_resume)
 
-    exit_code = main(["--workspace", str(tmp_path), "--resume", "latest"])
+    exit_code = main(
+        ["--workspace", str(tmp_path), "--resume", "latest", "--no-stream"]
+    )
 
     assert exit_code == 0
     assert observed["session_id"] == session_id
     assert observed["workspace"] == tmp_path.resolve()
     assert isinstance(observed["store"], SessionStore)
-    assert "final\nresumed" in capsys.readouterr().out
+    assert observed["stream"] is False
+    final_output = capsys.readouterr().out
+    assert "resumed" in final_output
+    assert "run.finished" in final_output
 
 
 def test_resume_rejects_new_task_permission_overrides(
@@ -223,7 +242,7 @@ def test_resume_rejects_new_task_permission_overrides(
         ["--workspace", str(tmp_path), "--resume", "latest", "--write"]
     )
 
-    assert exit_code == 1
+    assert exit_code == 2
     assert "--write may only be used when starting a new task" in capsys.readouterr().err
 
 
@@ -235,7 +254,7 @@ def test_session_mode_rejects_a_positional_task(
 
     exit_code = main(["--resume", "latest", "unexpected task"])
 
-    assert exit_code == 1
+    assert exit_code == 2
     assert "A task cannot be combined" in capsys.readouterr().err
 
 
@@ -247,7 +266,7 @@ def test_cli_requires_exactly_one_new_task_or_session_mode(
 
     exit_code = main([])
 
-    assert exit_code == 1
+    assert exit_code == 2
     assert "Provide a task or one of" in capsys.readouterr().err
 
 
@@ -274,7 +293,7 @@ def test_query_filters_are_restricted_to_their_modes(
     )
     approval_error = capsys.readouterr().err
 
-    assert verbose_exit == 1
+    assert verbose_exit == 2
     assert "--verbose is only supported with --replay" in verbose_error
-    assert approval_exit == 1
+    assert approval_exit == 2
     assert "only supported with --approvals" in approval_error

@@ -58,6 +58,7 @@ class SessionPrivacyPolicy:
             "sandbox_image": _redact_text(config.sandbox_image, secrets),
             "sandbox_image_digest": config.sandbox_image_digest,
             "full_auto": config.full_auto,
+            "task_mode": config.task_mode,
             "security_policy_version": SECURITY_POLICY_VERSION,
         }
 

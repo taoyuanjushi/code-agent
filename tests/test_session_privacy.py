@@ -97,9 +97,10 @@ def test_sanitize_config_uses_an_explicit_allowlist_and_redacts_known_secrets(
         "sandbox_mode": "none",
         "sandbox_image": "python:3.12-slim",
         "sandbox_image_digest": None,
-            "full_auto": False,
-            "security_policy_version": 1,
-        }
+        "full_auto": False,
+        "task_mode": "run",
+        "security_policy_version": 1,
+    }
     serialized = json.dumps(result, sort_keys=True)
     assert secret not in serialized
     assert "UNRELATED_SETTING" not in serialized

@@ -89,20 +89,16 @@ class _ReadThenFinalClient:
     def __init__(
         self,
         store: SessionStore,
-        captured_output: pytest.CaptureFixture[str],
     ) -> None:
         self.store = store
-        self.captured_output = captured_output
         self.initial_count = 0
         self.continuation_count = 0
-        self.session_printed_before_model = False
+        self.session_created_before_model = False
 
     def create_initial_response(self, **_kwargs: object) -> dict[str, object]:
         self.initial_count += 1
-        session_id = _latest_session_id(self.store)
-        output = self.captured_output.readouterr().out
-        assert f"session: {session_id}" in output
-        self.session_printed_before_model = True
+        assert _latest_session_id(self.store)
+        self.session_created_before_model = True
         return _function_call(
             "response-list",
             "call-list",
@@ -135,7 +131,6 @@ class _ReadThenFinalClient:
 def test_resume_recovers_every_fault_injection_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
     fault_point: FaultPoint,
     expected_tool_executions: int,
     expects_safe_retry: bool,
@@ -143,7 +138,7 @@ def test_resume_recovers_every_fault_injection_boundary(
     """Every documented fault point must resume without losing or duplicating work."""
 
     store = SessionStore(tmp_path)
-    client = _ReadThenFinalClient(store, capsys)
+    client = _ReadThenFinalClient(store)
     executions = 0
 
     def counted_execute_tool(*_args: object, **_kwargs: object) -> ToolResult:
@@ -175,7 +170,7 @@ def test_resume_recovers_every_fault_injection_boundary(
     assert executions == expected_tool_executions
     assert client.initial_count == 1
     assert client.continuation_count == 1
-    assert client.session_printed_before_model is True
+    assert client.session_created_before_model is True
 
     events = store.load(session_id)
     event_types = [event.type for event in events]

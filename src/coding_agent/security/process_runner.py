@@ -312,6 +312,21 @@ class HostProcessRunner:
                 clock=clock,
                 error_reason=str(exc) or "Failed while waiting for command.",
             )
+        except BaseException as exc:
+            cleanup_error = _cleanup_interrupted_process(
+                process,
+                readers,
+                resolved_cwd,
+                child_environment,
+                self._tree_terminator
+                or _default_tree_terminator(platform_name),
+            )
+            if cleanup_error:
+                exc.add_note(
+                    "Additionally, interrupted process cleanup failed: "
+                    + cleanup_error
+                )
+            raise
 
         _join_readers(readers, process)
         stdout, stderr, truncated, omitted_lines, omitted_bytes = _bounded_output(
@@ -511,6 +526,38 @@ def _start_reader(
     thread = threading.Thread(target=drain, name=f"host-process-{label}", daemon=True)
     thread.start()
     return thread
+
+
+def _cleanup_interrupted_process(
+    process: ProcessLike,
+    readers: list[threading.Thread | None],
+    cwd: Path,
+    environment: Mapping[str, str],
+    terminator: TreeTerminator,
+) -> str | None:
+    cleanup_error: str | None = None
+    try:
+        terminated, termination_error = terminator(process, cwd, environment)
+        cleanup_error = termination_error
+        if not terminated and cleanup_error is None:
+            cleanup_error = "process tree termination was not confirmed"
+    except BaseException as exc:
+        cleanup_error = f"{type(exc).__name__}: {exc}"
+
+    try:
+        process.wait(timeout=_TERMINATION_WAIT_SECONDS)
+    except BaseException as exc:
+        cleanup_error = _combine_errors(cleanup_error, str(exc))
+        try:
+            process.kill()
+            process.wait(timeout=_TERMINATION_WAIT_SECONDS)
+        except BaseException as kill_exc:
+            cleanup_error = _combine_errors(cleanup_error, str(kill_exc))
+    try:
+        _join_readers(readers, process)
+    except BaseException as exc:
+        cleanup_error = _combine_errors(cleanup_error, str(exc))
+    return cleanup_error
 
 
 def _join_readers(

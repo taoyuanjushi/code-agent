@@ -5,8 +5,10 @@ from typing import Any, Protocol
 from openai import OpenAI
 
 from .sessions.models import ModelFunctionCall, NormalizedModelResponse
+from .task_modes import tool_definitions_for_mode
 from .tools import TOOL_DEFINITIONS
 from .types import AgentConfig
+from .ui import UiEmitter
 
 
 class ModelClient(Protocol):
@@ -30,8 +32,20 @@ class ModelClient(Protocol):
 
 
 class OpenAIResponsesClient:
-    def __init__(self, client: OpenAI | None = None) -> None:
+    def __init__(
+        self,
+        client: OpenAI | None = None,
+        *,
+        ui_emitter: UiEmitter | None = None,
+        stream: bool = True,
+    ) -> None:
+        if ui_emitter is not None and not isinstance(ui_emitter, UiEmitter):
+            raise TypeError("ui_emitter must be a UiEmitter or null.")
+        if not isinstance(stream, bool):
+            raise TypeError("stream must be a boolean.")
         self._client = client or OpenAI()
+        self._ui_emitter = ui_emitter or UiEmitter()
+        self._stream = stream
 
     def create_initial_response(
         self,
@@ -40,7 +54,7 @@ class OpenAIResponsesClient:
         instructions: str,
         input_text: str,
     ) -> Any:
-        return self._client.responses.create(
+        return self._create_response(
             model=config.model,
             reasoning={
                 "effort": config.reasoning_effort,
@@ -48,7 +62,9 @@ class OpenAIResponsesClient:
             },
             instructions=instructions,
             input=input_text,
-            tools=TOOL_DEFINITIONS,
+            tools=tool_definitions_for_mode(
+                config.task_mode, TOOL_DEFINITIONS
+            ),
         )
 
     def create_tool_response(
@@ -58,7 +74,7 @@ class OpenAIResponsesClient:
         previous_response_id: str,
         tool_outputs: list[dict[str, Any]],
     ) -> Any:
-        return self._client.responses.create(
+        return self._create_response(
             model=config.model,
             reasoning={
                 "effort": config.reasoning_effort,
@@ -66,8 +82,63 @@ class OpenAIResponsesClient:
             },
             previous_response_id=previous_response_id,
             input=tool_outputs,
-            tools=TOOL_DEFINITIONS,
+            tools=tool_definitions_for_mode(
+                config.task_mode, TOOL_DEFINITIONS
+            ),
         )
+
+    def _create_response(self, **request: Any) -> Any:
+        if not self._stream:
+            return self._client.responses.create(**request)
+
+        events = self._client.responses.create(**request, stream=True)
+        completed_response: Any = None
+        text_deltas: list[str] = []
+        try:
+            for event in events:
+                event_type = _get_attr_or_key(event, "type")
+                if event_type == "response.output_text.delta":
+                    delta = _get_attr_or_key(event, "delta")
+                    if not isinstance(delta, str):
+                        raise RuntimeError(
+                            "Model text delta did not include string text."
+                        )
+                    if delta:
+                        text_deltas.append(delta)
+                        self._ui_emitter.emit(
+                            "model.output.delta",
+                            {"text": delta},
+                        )
+                elif event_type == "response.completed":
+                    completed_response = _get_attr_or_key(event, "response")
+                    if completed_response is None:
+                        raise RuntimeError(
+                            "Completed model stream did not include a response."
+                        )
+                elif event_type in {"response.failed", "response.incomplete"}:
+                    raise RuntimeError(_stream_failure_message(event))
+                elif event_type == "error":
+                    message = _get_attr_or_key(event, "message")
+                    raise RuntimeError(
+                        message
+                        if isinstance(message, str) and message
+                        else "Model stream reported an error."
+                    )
+        finally:
+            close = getattr(events, "close", None)
+            if callable(close):
+                close()
+
+        if completed_response is None:
+            raise RuntimeError(
+                "Model stream ended without a response.completed event."
+            )
+        normalized = normalize_model_response(completed_response)
+        if "".join(text_deltas) != normalized.text:
+            raise RuntimeError(
+                "Model stream text did not match the completed response."
+            )
+        return completed_response
 
 
 def normalize_model_response(response: Any) -> NormalizedModelResponse:
@@ -150,3 +221,13 @@ def _get_attr_or_key(value: Any, key: str) -> Any:
     if isinstance(value, dict):
         return value.get(key)
     return getattr(value, key, None)
+
+
+def _stream_failure_message(event: Any) -> str:
+    response = _get_attr_or_key(event, "response")
+    error = _get_attr_or_key(response, "error")
+    message = _get_attr_or_key(error, "message")
+    if isinstance(message, str) and message:
+        return message
+    event_type = _get_attr_or_key(event, "type")
+    return f"Model stream ended with {event_type}."

@@ -8,6 +8,7 @@ import pytest
 
 from tests.process_fakes import patch_tools_runner, patch_verification_runner
 
+import coding_agent.agent as agent_module
 import coding_agent.tools as tools_module
 import coding_agent.verification as verification_module
 from coding_agent.agent import run_agent_with_report
@@ -29,6 +30,7 @@ from coding_agent.tool_policy import (
 )
 from coding_agent.tools import TOOL_DEFINITIONS, execute_tool
 from coding_agent.types import AgentConfig, ToolResult
+from coding_agent.ui import UiEmitter, UiEvent
 
 
 def _config(
@@ -130,10 +132,13 @@ def test_agent_persists_approval_before_patch_side_effect(
     raw_arguments = json.dumps({"patch": patch})
     client = _ToolClient([_call("apply_patch", "call-patch", {"patch": patch})])
     original_apply = tools_module.apply_patch_plan
+    ui_events: list[UiEvent] = []
 
     def approval_handler(request: ApprovalRequest) -> ApprovalDecision:
         events = store.load(store.list_sessions()[0].session_id)
         assert events[-1].type == "tool.started"
+        assert ui_events[-1].type == "approval.requested"
+        assert patch in ui_events[-1].payload["message"]
         assert not (tmp_path / "created.txt").exists()
         assert request.arguments_sha256 == hash_tool_arguments(raw_arguments)
         return create_approval_decision(
@@ -145,6 +150,7 @@ def test_agent_persists_approval_before_patch_side_effect(
     def audited_apply(plan: object) -> None:
         events = store.load(store.list_sessions()[0].session_id)
         assert events[-1].type == "approval.decided"
+        assert ui_events[-1].type == "approval.decided"
         original_apply(plan)  # type: ignore[arg-type]
 
     monkeypatch.setattr(tools_module, "apply_patch_plan", audited_apply)
@@ -155,6 +161,7 @@ def test_agent_persists_approval_before_patch_side_effect(
         model_client=client,
         session_store=store,
         approval_handler=approval_handler,
+        ui_emitter=UiEmitter(ui_events.append),
     )
 
     assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "created\n"
@@ -174,6 +181,48 @@ def test_agent_persists_approval_before_patch_side_effect(
     finished = events[started_index + 2]
     touched = finished.payload["touched_file_hashes"]
     assert touched["created.txt"] == hashlib.sha256(b"created\n").hexdigest()
+
+
+def test_agent_denies_approval_that_cannot_be_rendered_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = _add_patch("large.txt", "safe content")
+    client = _ToolClient([_call("apply_patch", "call-large", {"patch": patch})])
+    ui_events: list[UiEvent] = []
+    approval_calls = 0
+    monkeypatch.setattr(
+        agent_module,
+        "render_approval_request",
+        lambda _request: "x" * 70_000,
+    )
+
+    def approval_handler(request: ApprovalRequest) -> ApprovalDecision:
+        nonlocal approval_calls
+        approval_calls += 1
+        return create_approval_decision(
+            request,
+            approved=True,
+            source="interactive",
+        )
+
+    run_agent_with_report(
+        "create a large file",
+        _config(tmp_path),
+        model_client=client,
+        approval_handler=approval_handler,
+        ui_emitter=UiEmitter(ui_events.append),
+    )
+
+    tool_result = json.loads(client.tool_outputs[0]["output"])
+    decisions = [
+        event for event in ui_events if event.type == "approval.decided"
+    ]
+    assert approval_calls == 0
+    assert tool_result["ok"] is False
+    assert "too large to display safely" in tool_result["output"]
+    assert decisions[-1].payload["outcome"] == "denied"
+    assert not (tmp_path / "large.txt").exists()
 
 
 def test_auto_approved_edit_and_command_are_audited(

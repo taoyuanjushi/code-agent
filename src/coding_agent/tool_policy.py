@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, Mapping
 
-ToolEffect = Literal["read_only", "workspace_write", "process"]
+ToolEffect = Literal["read_only", "session_only", "workspace_write", "process"]
 ApprovalGroup = Literal["edits", "commands"]
 
-TOOL_EFFECTS = frozenset({"read_only", "workspace_write", "process"})
+TOOL_EFFECTS = frozenset({"read_only", "session_only", "workspace_write", "process"})
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,8 @@ _POLICIES = (
     ToolPolicy("discover_verification_commands", "read_only", False),
     ToolPolicy("git_status", "read_only", False),
     ToolPolicy("git_diff", "read_only", False),
+    ToolPolicy("update_plan", "session_only", False),
+    ToolPolicy("submit_review", "session_only", False),
     ToolPolicy("apply_patch", "workspace_write", True, "edits"),
     ToolPolicy("run_verification", "process", True, "commands"),
     ToolPolicy("run_command", "process", True, "commands"),

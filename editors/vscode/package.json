@@ -1,0 +1,54 @@
+{
+  "name": "coding-agent-vscode",
+  "displayName": "Coding Agent Prototype",
+  "description": "Minimal VS Code commands for the local coding-agent CLI.",
+  "version": "0.0.1",
+  "private": true,
+  "publisher": "coding-agent-local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onCommand:codingAgent.runTask",
+    "onCommand:codingAgent.reviewChanges",
+    "onCommand:codingAgent.explainCurrentFile"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "codingAgent.runTask",
+        "title": "Coding Agent: Run Task"
+      },
+      {
+        "command": "codingAgent.reviewChanges",
+        "title": "Coding Agent: Review Changes"
+      },
+      {
+        "command": "codingAgent.explainCurrentFile",
+        "title": "Coding Agent: Explain Current File"
+      }
+    ],
+    "configuration": {
+      "title": "Coding Agent",
+      "properties": {
+        "codingAgent.executable": {
+          "type": "string",
+          "default": "coding-agent",
+          "scope": "machine-overridable",
+          "description": "Executable path passed directly to VS Code ProcessExecution."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node ./test/argv.test.js"
+  }
+}

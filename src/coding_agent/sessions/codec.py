@@ -5,6 +5,13 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
+from ..plans import (
+    EMPTY_PLAN,
+    PlanState,
+    plan_state_from_dict as decode_plan_state,
+    plan_state_to_dict as encode_plan_state,
+)
+from ..reviews import review_result_from_dict, review_result_to_dict
 from ..tools import VerificationToolState
 from ..verification import (
     VerificationCommand,
@@ -370,6 +377,14 @@ def pending_tool_call_from_dict(data: Mapping[str, object]) -> PendingToolCall:
     )
 
 
+def plan_state_to_dict(value: PlanState) -> dict[str, object]:
+    return encode_plan_state(value)
+
+
+def plan_state_from_dict(data: Mapping[str, object]) -> PlanState:
+    return decode_plan_state(data, allow_empty=True)
+
+
 def checkpoint_to_dict(value: AgentSessionCheckpoint) -> dict[str, object]:
     return {
         "phase": value.phase,
@@ -384,6 +399,12 @@ def checkpoint_to_dict(value: AgentSessionCheckpoint) -> dict[str, object]:
         "completed_call_ids": sorted(value.completed_call_ids),
         "verification_state": _thaw_json(value.verification_state),
         "touched_file_hashes": _thaw_json(value.touched_file_hashes),
+        "plan": plan_state_to_dict(value.plan),
+        "review": (
+            review_result_to_dict(value.review)
+            if value.review is not None
+            else None
+        ),
     }
 
 
@@ -400,6 +421,7 @@ def checkpoint_from_dict(data: Mapping[str, object]) -> AgentSessionCheckpoint:
             "verification_state",
             "touched_file_hashes",
         },
+        optional={"plan", "review"},
         label="AgentSessionCheckpoint",
     )
     return AgentSessionCheckpoint(
@@ -420,6 +442,16 @@ def checkpoint_from_dict(data: Mapping[str, object]) -> AgentSessionCheckpoint:
         ),
         verification_state=_json_object(obj, "verification_state"),
         touched_file_hashes=_json_object(obj, "touched_file_hashes"),
+        plan=(
+            plan_state_from_dict(_mapping(obj, "plan"))
+            if "plan" in obj
+            else EMPTY_PLAN
+        ),
+        review=(
+            review_result_from_dict(_mapping(obj, "review"))
+            if obj.get("review") is not None
+            else None
+        ),
     )
 
 
@@ -796,10 +828,12 @@ def _strict_object(
     *,
     required: set[str],
     label: str,
+    optional: set[str] | None = None,
 ) -> dict[str, object]:
     obj = dict(_require_mapping(data, label))
+    optional_fields = optional or set()
     missing = sorted(required - set(obj))
-    unknown = sorted(set(obj) - required)
+    unknown = sorted(set(obj) - required - optional_fields)
     if missing:
         raise ValueError(f"{label} is missing fields: {', '.join(missing)}")
     if unknown:

@@ -2,9 +2,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from coding_agent.agent import run_agent
 from coding_agent.prompts import build_system_prompt
 from coding_agent.types import AgentConfig
+from coding_agent.ui import UiEmitter, UiEvent
 
 
 class FakeModelClient:
@@ -69,7 +72,10 @@ class FakeModelClient:
         }
 
 
-def test_run_agent_accepts_mock_model_client(tmp_path: Path) -> None:
+def test_run_agent_accepts_mock_model_client(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     (tmp_path / "hello.txt").write_text("hello\n", encoding="utf-8")
     config = AgentConfig(
         workspace=str(tmp_path),
@@ -83,8 +89,14 @@ def test_run_agent_accepts_mock_model_client(tmp_path: Path) -> None:
         context_max_bytes_per_file=1000,
     )
     client = FakeModelClient()
+    ui_events: list[UiEvent] = []
 
-    answer = run_agent("search hello", config, model_client=client)
+    answer = run_agent(
+        "search hello",
+        config,
+        model_client=client,
+        ui_emitter=UiEmitter(ui_events.append),
+    )
 
     assert answer == "Read hello.txt successfully."
     assert len(client.initial_calls) == 1
@@ -94,6 +106,28 @@ def test_run_agent_accepts_mock_model_client(tmp_path: Path) -> None:
     assert client.tool_calls[0]["tool_outputs"][0]["call_id"] == "call-1"
     assert '"ok": true' in client.tool_calls[0]["tool_outputs"][0]["output"]
     assert "hello.txt:1:1" in client.tool_calls[0]["tool_outputs"][0]["output"]
+    assert [event.type for event in ui_events] == [
+        "run.started",
+        "model.started",
+        "model.finished",
+        "tool.started",
+        "tool.finished",
+        "model.started",
+        "model.finished",
+        "run.finished",
+    ]
+    assert [event.seq for event in ui_events] == list(range(1, 9))
+    assert ui_events[4].payload["status"] == "passed"
+    assert ui_events[-1].payload["answer"] == answer
+    assert ui_events[-1].payload["session_id"]
+    assert capsys.readouterr() == ("", "")
+    with pytest.raises(TypeError, match="ui_emitter"):
+        run_agent(
+            "search hello",
+            config,
+            model_client=client,
+            ui_emitter=object(),  # type: ignore[arg-type]
+        )
 
 
 class _SearchThenReadClient:

@@ -15,6 +15,8 @@ from ..approvals import (
     ApprovalRequest,
     ApprovalSource,
 )
+from ..plans import EMPTY_PLAN, PlanState
+from ..reviews import ReviewResult
 from ..tool_policy import TOOL_EFFECTS, ToolEffect
 
 SESSION_SCHEMA_VERSION = 1
@@ -42,6 +44,7 @@ SessionEventType = Literal[
     "tool.recovered",
     "approval.decided",
     "verification.recorded",
+    "plan.updated",
     "security.policy_evaluated",
     "sandbox.capability_checked",
     "sandbox.snapshot_created",
@@ -81,6 +84,7 @@ SESSION_CONFIG_FIELDS = frozenset(
         "sandbox_image",
         "sandbox_image_digest",
         "full_auto",
+        "task_mode",
         "security_policy_version",
     }
 )
@@ -99,6 +103,7 @@ SESSION_EVENT_TYPES = frozenset(
         "tool.recovered",
         "approval.decided",
         "verification.recorded",
+        "plan.updated",
         "security.policy_evaluated",
         "sandbox.capability_checked",
         "sandbox.snapshot_created",
@@ -143,7 +148,7 @@ class WorkspaceGuard:
         _validate_absolute_path(self.workspace, "workspace")
         if self.git_head is not None:
             _validate_non_empty_string(self.git_head, "git_head")
-        hashes = _freeze_json_object(self.touched_file_hashes, "touched_file_hashes")
+        hashes = freeze_json_object(self.touched_file_hashes, "touched_file_hashes")
         for path, value in hashes.items():
             _validate_relative_posix_path(path, "touched file path")
             if value is not None:
@@ -168,7 +173,7 @@ class SessionStarted:
             raise ValueError("workspace must match workspace_guard.workspace.")
         if self.git_head != self.workspace_guard.git_head:
             raise ValueError("git_head must match workspace_guard.git_head.")
-        config = _freeze_json_object(self.config, "session config")
+        config = freeze_json_object(self.config, "session config")
         unsupported = sorted(set(config) - SESSION_CONFIG_FIELDS)
         if unsupported:
             raise ValueError(
@@ -241,6 +246,8 @@ class AgentSessionCheckpoint:
     completed_call_ids: frozenset[str]
     verification_state: JsonObject
     touched_file_hashes: JsonObject
+    plan: PlanState = EMPTY_PLAN
+    review: ReviewResult | None = None
 
     def __post_init__(self) -> None:
         if self.phase not in SESSION_PHASES:
@@ -261,7 +268,7 @@ class AgentSessionCheckpoint:
 
         outputs = _require_tuple(self.pending_tool_outputs, "pending_tool_outputs")
         frozen_outputs = tuple(
-            _freeze_json_object(output, "pending tool output") for output in outputs
+            freeze_json_object(output, "pending tool output") for output in outputs
         )
         object.__setattr__(self, "pending_tool_outputs", frozen_outputs)
 
@@ -275,9 +282,9 @@ class AgentSessionCheckpoint:
         object.__setattr__(
             self,
             "verification_state",
-            _freeze_json_object(self.verification_state, "verification_state"),
+            freeze_json_object(self.verification_state, "verification_state"),
         )
-        hashes = _freeze_json_object(
+        hashes = freeze_json_object(
             self.touched_file_hashes,
             "touched_file_hashes",
         )
@@ -288,6 +295,10 @@ class AgentSessionCheckpoint:
                     raise TypeError("touched file hash must be a string or null.")
                 _validate_sha256(value, f"hash for {path}")
         object.__setattr__(self, "touched_file_hashes", hashes)
+        if not isinstance(self.plan, PlanState):
+            raise TypeError("plan must be a PlanState.")
+        if self.review is not None and not isinstance(self.review, ReviewResult):
+            raise TypeError("review must be a ReviewResult or null.")
 
         if self.phase == "awaiting_initial_model" and self.previous_response_id is not None:
             raise ValueError(
@@ -311,6 +322,8 @@ class AgentSessionState:
     completed_call_ids: frozenset[str]
     verification_state: JsonObject
     touched_file_hashes: JsonObject
+    plan: PlanState = EMPTY_PLAN
+    review: ReviewResult | None = None
     status: SessionStatus = "running"
     approvals: tuple[ApprovalDecision, ...] = ()
     context_created: bool = field(default=False, repr=False, compare=False)
@@ -336,6 +349,8 @@ class AgentSessionState:
             completed_call_ids=self.completed_call_ids,
             verification_state=self.verification_state,
             touched_file_hashes=self.touched_file_hashes,
+            plan=self.plan,
+            review=self.review,
         )
         object.__setattr__(self, "pending_tool_calls", checkpoint.pending_tool_calls)
         object.__setattr__(
@@ -358,6 +373,8 @@ class AgentSessionState:
             "touched_file_hashes",
             checkpoint.touched_file_hashes,
         )
+        object.__setattr__(self, "plan", checkpoint.plan)
+        object.__setattr__(self, "review", checkpoint.review)
 
         if self.status not in SESSION_STATUSES:
             raise ValueError(f"Unsupported session status: {self.status}")
@@ -409,6 +426,8 @@ class AgentSessionState:
             completed_call_ids=self.completed_call_ids,
             verification_state=self.verification_state,
             touched_file_hashes=self.touched_file_hashes,
+            plan=self.plan,
+            review=self.review,
         )
 
 
@@ -448,12 +467,14 @@ class SessionEvent:
         object.__setattr__(
             self,
             "payload",
-            _freeze_json_object(self.payload, "event payload"),
+            freeze_json_object(self.payload, "event payload"),
         )
 
 
 
-def _freeze_json_object(value: object, label: str) -> JsonObject:
+def freeze_json_object(value: object, label: str) -> JsonObject:
+    """Validate and deeply freeze a JSON-compatible mapping."""
+
     if not isinstance(value, Mapping):
         raise TypeError(f"{label} must be a mapping.")
     frozen: dict[str, JsonValue] = {}
@@ -475,7 +496,7 @@ def _freeze_json_value(value: object, label: str) -> JsonValue:
             raise ValueError(f"{label} must be a finite JSON number.")
         return value
     if isinstance(value, Mapping):
-        return _freeze_json_object(value, label)
+        return freeze_json_object(value, label)
     if isinstance(value, (list, tuple)):
         return tuple(
             _freeze_json_value(item, f"{label}[{index}]")

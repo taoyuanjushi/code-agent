@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from .task_modes import TaskMode
+
 ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh"]
 PermissionMode = Literal["read-only", "workspace-write"]
 SandboxMode = Literal["none", "auto", "docker"]
@@ -23,6 +25,7 @@ class AgentConfig:
     sandbox_image: str = "python:3.12-slim"
     sandbox_image_digest: str | None = None
     full_auto: bool = False
+    task_mode: TaskMode = "run"
 
 
 @dataclass(frozen=True)

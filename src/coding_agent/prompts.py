@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 
 from .instructions import AgentInstruction, format_agent_instructions
+from .task_modes import task_mode_prompt_fragment
 from .types import AgentConfig
 
 PROJECT_UNDERSTANDING_WORKFLOW = """Project understanding workflow:
@@ -55,6 +56,8 @@ Goal:
 - Prefer small, safe changes that match the existing project.
 
 {PROJECT_UNDERSTANDING_WORKFLOW}
+
+{task_mode_prompt_fragment(config.task_mode)}
 
 Execution rules:
 - Workspace root: {config.workspace}

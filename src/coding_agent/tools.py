@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .explanations import (
+    ExplanationReadEvidence,
+    explanation_read_evidence_list_to_dict,
+)
 from .approvals import (
     ApprovalHandler,
     ApprovalRequest,
@@ -19,12 +23,34 @@ from .instructions import (
     format_agent_instructions,
     instructions_for_path,
 )
+from .plans import (
+    EMPTY_PLAN,
+    PLAN_MAX_EXPLANATION_CHARS,
+    PLAN_MAX_ITEMS,
+    PLAN_MAX_STEP_CHARS,
+    PLAN_MIN_ITEMS,
+    PLAN_STATUSES,
+    PlanState,
+    parse_plan_update,
+    plan_state_to_dict,
+    validate_plan_transition,
+)
 from .patch import (
     FilePatchPlan,
     PatchPlan,
     apply_patch_plan,
     plan_patch,
     summarize_patch_plan,
+)
+from .reviews import (
+    REVIEW_MAX_DETAIL_CHARS,
+    REVIEW_MAX_FINDINGS,
+    REVIEW_MAX_SUMMARY_CHARS,
+    REVIEW_MAX_TITLE_CHARS,
+    ReviewFinding,
+    ReviewResult,
+    parse_review_submission,
+    review_result_to_dict,
 )
 from .path_safety import resolve_workspace_path
 from .reader import (
@@ -35,6 +61,7 @@ from .reader import (
     read_many_files,
 )
 from .search import format_search_matches, search_text
+from .task_modes import is_tool_allowed
 from .security.command_policy import (
     evaluate_command_policy,
     format_command_policy_block,
@@ -329,6 +356,100 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "update_plan",
+        "description": (
+            "Replace the complete session plan. This updates resumable session "
+            "state only and never writes workspace files."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "explanation": {
+                    "type": "string",
+                    "maxLength": PLAN_MAX_EXPLANATION_CHARS,
+                    "description": "Optional short reason for the plan update.",
+                },
+                "items": {
+                    "type": "array",
+                    "minItems": PLAN_MIN_ITEMS,
+                    "maxItems": PLAN_MAX_ITEMS,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "step": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": PLAN_MAX_STEP_CHARS,
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": sorted(PLAN_STATUSES),
+                            },
+                        },
+                        "required": ["step", "status"],
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "submit_review",
+        "description": (
+            "Submit the one final structured result for a review-mode session. "
+            "Every finding path and line is revalidated without returning file text."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": REVIEW_MAX_SUMMARY_CHARS,
+                },
+                "findings": {
+                    "type": "array",
+                    "maxItems": REVIEW_MAX_FINDINGS,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "severity": {
+                                "type": "string",
+                                "enum": ["critical", "high", "medium", "low"],
+                            },
+                            "path": {"type": "string", "minLength": 1},
+                            "line": {"type": "integer", "minimum": 1},
+                            "title": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": REVIEW_MAX_TITLE_CHARS,
+                            },
+                            "detail": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": REVIEW_MAX_DETAIL_CHARS,
+                            },
+                        },
+                        "required": [
+                            "severity",
+                            "path",
+                            "line",
+                            "title",
+                            "detail",
+                        ],
+                    },
+                },
+            },
+            "required": ["summary", "findings"],
+        },
+    },
+    {
+        "type": "function",
         "name": "run_command",
         "description": "Run a structured command in the workspace and return stdout/stderr. Arguments are passed directly without a shell.",
         "parameters": {
@@ -359,6 +480,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
 ]
 
+_EXPOSED_TOOL_NAMES = frozenset(
+    definition["name"] for definition in TOOL_DEFINITIONS
+)
+
 
 def execute_tool(
     config: AgentConfig,
@@ -366,26 +491,55 @@ def execute_tool(
     raw_arguments: str,
     *,
     state: VerificationToolState | None = None,
+    plan_state: PlanState | None = None,
+    review_result: ReviewResult | None = None,
     approval_handler: ApprovalHandler | None = None,
     call_id: str | None = None,
     session_id: str | None = None,
     security_event_handler: SecurityEventHandler | None = None,
 ) -> ToolResult:
     try:
-        args = _parse_tool_arguments(raw_arguments)
-        arguments_sha256 = hash_tool_arguments(raw_arguments)
-        effective_call_id = call_id or f"direct-{name}-{arguments_sha256[:16]}"
-        handler = approval_handler or build_default_approval_handler(config)
-
-        if name == "read_file":
-            return _read_file_tool(config, args)
-        if name == "read_many_files":
-            return _read_many_files_tool(config, args)
         if name == "write_file":
             return ToolResult(
                 ok=False,
                 output="write_file is disabled. Submit a unified diff through apply_patch so every edit is reviewable.",
             )
+        if name not in _EXPOSED_TOOL_NAMES:
+            return ToolResult(ok=False, output=f"Unknown tool: {name}")
+        if not is_tool_allowed(config.task_mode, name):
+            return ToolResult(
+                ok=False,
+                output=(
+                    f"Tool {name!r} is not allowed in "
+                    f"{config.task_mode} task mode."
+                ),
+                data={
+                    "type": "task_mode_policy_rejection",
+                    "task_mode": config.task_mode,
+                    "tool_name": name,
+                    "status": "denied",
+                    "disposition": "deny",
+                    "requires_approval": False,
+                },
+            )
+
+        args = _parse_tool_arguments(raw_arguments)
+        arguments_sha256 = hash_tool_arguments(raw_arguments)
+        effective_call_id = call_id or f"direct-{name}-{arguments_sha256[:16]}"
+        handler = approval_handler or build_default_approval_handler(config)
+
+        if name == "update_plan":
+            return _update_plan_tool(args, previous_plan=plan_state or EMPTY_PLAN)
+        if name == "submit_review":
+            return _submit_review_tool(
+                config,
+                args,
+                previous_review=review_result,
+            )
+        if name == "read_file":
+            return _read_file_tool(config, args)
+        if name == "read_many_files":
+            return _read_many_files_tool(config, args)
         if name == "apply_patch":
             return _apply_patch_tool(
                 config,
@@ -447,6 +601,128 @@ def _parse_tool_arguments(raw_arguments: str) -> dict[str, Any]:
     return parsed
 
 
+def _update_plan_tool(
+    args: dict[str, Any],
+    *,
+    previous_plan: PlanState,
+) -> ToolResult:
+    updated = parse_plan_update(args)
+    validate_plan_transition(previous_plan, updated)
+    counts = {
+        status: sum(item.status == status for item in updated.items)
+        for status in PLAN_STATUSES
+    }
+    return ToolResult(
+        ok=True,
+        output=(
+            f"Plan updated with {len(updated.items)} items: "
+            f"{counts['completed']} completed, "
+            f"{counts['in_progress']} in progress, "
+            f"{counts['pending']} pending."
+        ),
+        data={
+            "type": "plan_update",
+            "plan": plan_state_to_dict(updated),
+        },
+    )
+
+
+def _submit_review_tool(
+    config: AgentConfig,
+    args: dict[str, Any],
+    *,
+    previous_review: ReviewResult | None,
+) -> ToolResult:
+    if previous_review is not None:
+        return ToolResult(
+            ok=False,
+            output="A final review has already been submitted for this session.",
+        )
+
+    submitted = parse_review_submission(args)
+    root = Path(config.workspace).resolve(strict=True)
+    sensitive_policy = load_sensitive_path_policy(root)
+    ignore_policy = load_ignore_policy(root)
+    line_counts: dict[str, int] = {}
+    normalized_findings: list[ReviewFinding] = []
+
+    for finding in submitted.findings:
+        full_path = resolve_workspace_path(
+            root,
+            finding.path,
+            operation="read",
+            allow_missing=False,
+        )
+        normalized_path = full_path.relative_to(root).as_posix()
+        sensitive_decision = sensitive_policy.evaluate(
+            full_path,
+            operation="read",
+        )
+        if not sensitive_decision.allowed:
+            raise ValueError(
+                f"Review finding path is sensitive and cannot be submitted: "
+                f"{normalized_path}"
+            )
+        if not full_path.is_file():
+            raise ValueError(
+                f"Review finding path is not an existing file: {normalized_path}"
+            )
+
+        line_count = line_counts.get(normalized_path)
+        if line_count is None:
+            if ignore_policy.is_binary(full_path):
+                raise ValueError(
+                    "Review finding path is not a text file: "
+                    f"{normalized_path}"
+                )
+            raw = full_path.read_bytes()
+            if b"\x00" in raw:
+                raise ValueError(
+                    "Review finding path is not a text file: "
+                    f"{normalized_path}"
+                )
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    "Review finding path is not valid UTF-8 text: "
+                    f"{normalized_path}"
+                ) from exc
+            line_count = len(text.splitlines())
+            line_counts[normalized_path] = line_count
+
+        if finding.line > line_count:
+            raise ValueError(
+                f"Review finding line {finding.line} exceeds the "
+                f"{line_count} lines in {normalized_path}."
+            )
+        normalized_findings.append(
+            ReviewFinding(
+                severity=finding.severity,
+                path=normalized_path,
+                line=finding.line,
+                title=finding.title,
+                detail=finding.detail,
+            )
+        )
+
+    review = ReviewResult(
+        summary=submitted.summary,
+        findings=tuple(normalized_findings),
+    )
+    return ToolResult(
+        ok=True,
+        output=(
+            f"Review submitted with {len(review.findings)} structured "
+            "finding(s)."
+        ),
+        data={
+            "type": "review_submission",
+            "review": review_result_to_dict(review),
+        },
+    )
+
+
 def _read_file_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
     relative_path = _require_string(args.get("path"), "path")
     max_bytes = _require_positive_int(
@@ -506,6 +782,18 @@ def _read_file_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResult:
             f"[File contents: {normalized_path}]\n"
             f"{content}{suffix}"
         ),
+        data={
+            "type": "read_evidence",
+            "files": explanation_read_evidence_list_to_dict(
+                (
+                    ExplanationReadEvidence(
+                        path=normalized_path,
+                        max_line=len(content.splitlines()),
+                        truncated=len(data) > max_bytes,
+                    ),
+                )
+            ),
+        },
     )
 
 
@@ -544,6 +832,18 @@ def _read_many_files_tool(config: AgentConfig, args: dict[str, Any]) -> ToolResu
     return ToolResult(
         ok=True,
         output=format_file_read_results(config.workspace, results),
+        data={
+            "type": "read_evidence",
+            "files": explanation_read_evidence_list_to_dict(
+                ExplanationReadEvidence(
+                    path=result.path,
+                    max_line=len(result.content.splitlines()),
+                    truncated=result.truncated,
+                )
+                for result in results
+                if result.ok
+            ),
+        },
     )
 
 

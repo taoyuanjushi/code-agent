@@ -67,6 +67,7 @@ class ApprovalDecision:
 
 
 ApprovalHandler = Callable[[ApprovalRequest], ApprovalDecision]
+ApprovalInputReader: TypeAlias = Callable[[str], str]
 
 
 
@@ -111,8 +112,16 @@ def validate_approval_decision(
 
 
 
-def build_resume_recovery_approval_handler() -> ApprovalHandler:
+def build_resume_recovery_approval_handler(
+    *,
+    request_writer: Callable[[str], None] = print,
+    input_reader: ApprovalInputReader | None = None,
+) -> ApprovalHandler:
     """Create an interactive recovery handler that never honors auto-approval."""
+    if not callable(request_writer):
+        raise TypeError("request_writer must be callable.")
+    if input_reader is not None and not callable(input_reader):
+        raise TypeError("input_reader must be callable or null.")
 
     def handle(request: ApprovalRequest) -> ApprovalDecision:
         policy = get_tool_policy(request.action)
@@ -129,11 +138,11 @@ def build_resume_recovery_approval_handler() -> ApprovalHandler:
                 f"Retry interrupted {request.action}?\n{request.summary}\n"
                 f"arguments: {arguments}"
             )
-        print(rendered)
-        approved = input("Retry interrupted tool call? [y/N] ").strip().lower() in {
-            "y",
-            "yes",
-        }
+        request_writer(rendered)
+        approved = _read_approval_input(
+            "Retry interrupted tool call? [y/N] ",
+            input_reader,
+        ).strip().lower() in {"y", "yes"}
         return create_approval_decision(
             request,
             approved=approved,
@@ -162,8 +171,17 @@ def validate_resume_recovery_decision(
         )
 
 
-def build_default_approval_handler(config: AgentConfig) -> ApprovalHandler:
+def build_default_approval_handler(
+    config: AgentConfig,
+    *,
+    request_writer: Callable[[str], None] = print,
+    input_reader: ApprovalInputReader | None = None,
+) -> ApprovalHandler:
     """Create the only production approval handler that reads stdin."""
+    if not callable(request_writer):
+        raise TypeError("request_writer must be callable.")
+    if input_reader is not None and not callable(input_reader):
+        raise TypeError("input_reader must be callable or null.")
 
     def handle(request: ApprovalRequest) -> ApprovalDecision:
         policy = get_tool_policy(request.action)
@@ -172,7 +190,7 @@ def build_default_approval_handler(config: AgentConfig) -> ApprovalHandler:
                 f"Tool {request.action!r} does not require approval."
             )
 
-        print(render_approval_request(request))
+        request_writer(render_approval_request(request))
         auto_approved = (
             policy.approval_group == "edits" and config.auto_approve_edits
         ) or (
@@ -190,7 +208,10 @@ def build_default_approval_handler(config: AgentConfig) -> ApprovalHandler:
             if policy.approval_group == "edits"
             else "Run command? [y/N] "
         )
-        approved = input(prompt).strip().lower() in {"y", "yes"}
+        approved = _read_approval_input(prompt, input_reader).strip().lower() in {
+            "y",
+            "yes",
+        }
         return create_approval_decision(
             request,
             approved=approved,
@@ -200,6 +221,18 @@ def build_default_approval_handler(config: AgentConfig) -> ApprovalHandler:
 
     return handle
 
+
+
+def _read_approval_input(
+    prompt: str,
+    input_reader: ApprovalInputReader | None,
+) -> str:
+    if input_reader is None:
+        return input(prompt)
+    response = input_reader(prompt)
+    if not isinstance(response, str):
+        raise TypeError("input_reader must return a string.")
+    return response
 
 
 def render_approval_request(request: ApprovalRequest) -> str:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import Mapping, cast
 
 from ..approvals import validate_approval_decision
+from ..plans import EMPTY_PLAN, validate_plan_transition
+from ..reviews import ReviewResult, review_result_from_dict
 from ..security.models import (
     CommandPolicyDecision,
     SandboxCapability,
@@ -24,6 +27,7 @@ from .codec import (
     checkpoint_from_dict,
     normalized_model_response_from_dict,
     pending_tool_call_from_dict,
+    plan_state_from_dict,
     session_started_from_dict,
     verification_result_from_dict,
     verification_tool_state_from_dict,
@@ -76,6 +80,7 @@ def reduce_event(
             "tool.recovered": _recover_tool,
             "approval.decided": _record_approval,
             "verification.recorded": _record_verification,
+            "plan.updated": _update_plan,
             "security.policy_evaluated": _record_security_event,
             "sandbox.capability_checked": _record_security_event,
             "sandbox.snapshot_created": _record_security_event,
@@ -139,6 +144,8 @@ def _start_session(event: SessionEvent) -> AgentSessionState:
         completed_call_ids=frozenset(),
         verification_state=verification_tool_state_to_dict(verification),
         touched_file_hashes=started.workspace_guard.touched_file_hashes,
+        plan=EMPTY_PLAN,
+        review=None,
         status="running",
         approvals=(),
         context_created=False,
@@ -354,10 +361,11 @@ def _complete_tool_call(
             raise SessionReductionError(
                 "tool.recovered requires_reapproval must be a boolean."
             )
-        if call.effect == "read_only":
+        if call.effect in {"read_only", "session_only"}:
             if reason != "safe_retry" or requires_reapproval:
                 raise SessionReductionError(
-                    "read-only recovery must use safe_retry without approval."
+                    "read-only and session-only recovery must use safe_retry "
+                    "without approval."
                 )
         elif call.effect == "process" and reason == "sandbox_reconciled":
             if requires_reapproval:
@@ -412,6 +420,12 @@ def _complete_tool_call(
         )
 
     tool_output = _extract_tool_output(data, call_id)
+    review = _review_from_tool_completion(
+        data,
+        call,
+        tool_output,
+        state.review,
+    )
     remaining = tuple(
         pending
         for pending in state.pending_tool_calls
@@ -436,6 +450,7 @@ def _complete_tool_call(
         completed_call_ids=completed,
         verification_state=verification_state,
         touched_file_hashes=touched_file_hashes,
+        review=review,
     )
 
 
@@ -558,6 +573,18 @@ def _record_verification(
         mutable_state.record_verification(result)
         verification_state = verification_tool_state_to_dict(mutable_state)
     return _advance(state, event, verification_state=verification_state)
+
+
+def _update_plan(
+    state: AgentSessionState,
+    event: SessionEvent,
+) -> AgentSessionState:
+    _require_running(state, event)
+    plan = plan_state_from_dict(_domain_payload(event.payload, "plan"))
+    if not plan.items:
+        raise SessionReductionError("plan.updated requires at least one plan item.")
+    validate_plan_transition(state.plan, plan)
+    return _advance(state, event, plan=plan)
 
 
 def _record_security_event(
@@ -880,6 +907,53 @@ def _extract_tool_output(
     )
 
 
+def _review_from_tool_completion(
+    data: Mapping[str, JsonValue],
+    call: PendingToolCall,
+    tool_output: JsonObject,
+    current: ReviewResult | None,
+) -> ReviewResult | None:
+    review_data = _find_mapping(data, "review")
+    output_ok = _tool_output_ok(tool_output)
+
+    if call.name != "submit_review":
+        if review_data is not None:
+            raise SessionReductionError(
+                "only submit_review tool completions may carry review state."
+            )
+        return current
+
+    if review_data is None:
+        if output_ok is True:
+            raise SessionReductionError(
+                "successful submit_review completion requires structured review state."
+            )
+        return current
+    if output_ok is not True:
+        raise SessionReductionError(
+            "failed submit_review completion cannot persist review state."
+        )
+    if current is not None:
+        raise SessionReductionError(
+            "a review result has already been submitted for this session."
+        )
+    return review_result_from_dict(review_data)
+
+
+def _tool_output_ok(tool_output: JsonObject) -> bool | None:
+    raw_output = tool_output.get("output")
+    if not isinstance(raw_output, str):
+        return None
+    try:
+        payload = json.loads(raw_output)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    ok = payload.get("ok")
+    return ok if isinstance(ok, bool) else None
+
+
 def _verification_state_from_payload(
     data: Mapping[str, JsonValue],
     current: JsonObject,
@@ -920,6 +994,8 @@ def _checkpoint_differences(
         "completed_call_ids",
         "verification_state",
         "touched_file_hashes",
+        "plan",
+        "review",
     )
     return [name for name in fields if getattr(rebuilt, name) != getattr(stored, name)]
 
